@@ -1,0 +1,15 @@
+# Local notes / planning (never publish)
+.local/
+
+# SwiftPM / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# OS / editor
+.DS_Store
+*~
+.*.swp
