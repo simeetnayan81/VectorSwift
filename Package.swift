@@ -8,7 +8,6 @@ let package = Package(
         .iOS(.v16),
     ],
     products: [
-        // Apps and servers depend only on this product.
         .library(
             name: "VectorSwift",
             targets: ["VectorSwift"]
@@ -46,7 +45,11 @@ let package = Package(
         ),
         .testTarget(
             name: "VectorSwiftTests",
-            dependencies: ["VectorSwift"],
+            dependencies: [
+                "VectorSwift",
+                "VectorSwiftCompute",
+                "VectorSwiftIndex",
+            ],
             path: "Tests/VectorSwiftTests"
         ),
     ]
