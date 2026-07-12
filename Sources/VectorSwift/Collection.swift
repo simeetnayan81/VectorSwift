@@ -1,10 +1,13 @@
 import VectorSwiftCore
+import VectorSwiftCompute
+import VectorSwiftIndex
 
 /// In-memory collection of points. No disk I/O.
 public actor Collection {
     public nonisolated let name: String
 
     private let collectionConfig: CollectionConfig
+    private let compute: any VectorCompute
     private var live: [PointID: Entry] = [:]
     /// Number of successful deletes of previously live ids (for `count(includeTombstones:)`).
     private var tombstoneCount: Int = 0
@@ -15,7 +18,12 @@ public actor Collection {
     }
 
     /// Creates an empty in-memory collection.
-    public init(config: CollectionConfig) throws {
+    ///
+    /// - Parameter compute: Distance backend used by search (default: portable CPU).
+    public init(
+        config: CollectionConfig,
+        compute: any VectorCompute = PortableCPUCompute()
+    ) throws {
         try VectorValidation.requireCollectionName(config.name)
         guard config.dimension >= 1 else {
             throw VectorSwiftError.invalidArgument(
@@ -24,6 +32,7 @@ public actor Collection {
         }
         self.name = config.name
         self.collectionConfig = config
+        self.compute = compute
     }
 
     public var config: CollectionConfig {
@@ -73,6 +82,63 @@ public actor Collection {
         return result
     }
 
+    /// Exact nearest-neighbor search over all live points (flat index).
+    ///
+    /// Results are ordered by nondecreasing `distance` (smaller = closer).
+    /// `SearchRequest.filter` is ignored until filtered search is implemented.
+    /// `SearchRequest.ef` is ignored for flat search.
+    public func search(_ request: SearchRequest) throws -> [ScoredPoint] {
+        try VectorValidation.requireDimension(
+            request.vector,
+            expected: collectionConfig.dimension
+        )
+        guard request.k >= 1 else {
+            throw VectorSwiftError.invalidArgument("k must be >= 1, got \(request.k)")
+        }
+
+        if live.isEmpty {
+            return []
+        }
+
+        var query = request.vector
+        if collectionConfig.normalizeVectors {
+            query = try VectorValidation.normalized(query)
+        }
+
+        let snapshot = liveSnapshot()
+        let count = snapshot.ids.count
+        let dim = collectionConfig.dimension
+
+        // Row-major matrix: row i is snapshot.vectors[i]
+        var matrix = [Float]()
+        matrix.reserveCapacity(count * dim)
+        for vector in snapshot.vectors {
+            matrix.append(contentsOf: vector)
+        }
+
+        let hits = try matrix.withUnsafeBufferPointer { buffer in
+            try FlatIndex.search(
+                query: query,
+                database: buffer,
+                count: count,
+                dim: dim,
+                k: request.k,
+                metric: collectionConfig.metric,
+                compute: compute
+            )
+        }
+
+        return hits.map { hit in
+            let i = Int(hit.row)
+            return ScoredPoint(
+                id: snapshot.ids[i],
+                distance: hit.distance,
+                payload: request.withPayload ? snapshot.payloads[i] : nil,
+                vector: request.withVector ? snapshot.vectors[i] : nil
+            )
+        }
+    }
+
     /// Live point count, or live + tombstones when `includeTombstones` is true.
     public func count(includeTombstones: Bool = false) -> Int {
         if includeTombstones {
@@ -84,10 +150,14 @@ public actor Collection {
     /// No-op for the in-memory engine.
     public func checkpoint() {}
 
-    // MARK: - Internals for search (S07)
+    // MARK: - Internals
 
-    /// Snapshot of live rows for indexing. Order is unspecified but stable for a given snapshot.
-    func liveSnapshot() -> (ids: [PointID], vectors: [[Float]], payloads: [[String: PayloadValue]]) {
+    /// Snapshot of live rows. Dictionary iteration order is used as row order for this search.
+    private func liveSnapshot() -> (
+        ids: [PointID],
+        vectors: [[Float]],
+        payloads: [[String: PayloadValue]]
+    ) {
         var ids: [PointID] = []
         var vectors: [[Float]] = []
         var payloads: [[String: PayloadValue]] = []
