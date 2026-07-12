@@ -3,12 +3,16 @@ import VectorSwiftCompute
 import VectorSwiftIndex
 import VectorSwiftQuery
 
-/// Public library product. Import this module from apps and services.
+/// Public library product. Import this module from applications and services.
+///
+/// Re-exports `VectorSwiftCore` so types such as `Point`, `SearchRequest`, and
+/// `VectorSwiftError` are available without a second import. Higher-level types
+/// (`Database`, `Collection`) live in this module.
 public enum VectorSwift: Sendable {
-    /// Library name for diagnostics.
+    /// Library name for diagnostics and smoke tests.
     public static let name = "VectorSwift"
 
-    /// Names of modules linked into this product (used by smoke tests).
+    /// Module names linked into this product (used by package smoke tests).
     public static var linkedModules: [String] {
         [
             VectorSwiftCoreModule.moduleName,

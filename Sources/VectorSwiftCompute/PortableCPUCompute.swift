@@ -1,6 +1,15 @@
 import VectorSwiftCore
 
-/// Portable CPU implementation of `VectorCompute` (per-row `VectorDistance`).
+/// CPU `VectorCompute` backend that scores each row with `VectorDistance`.
+///
+/// This is the default, always-available implementation: correct, portable, and
+/// independent of Metal/MLX. It walks the row-major matrix in Swift and reuses
+/// the shared pointer-based distance formulas so behavior matches the reference
+/// oracle used in tests.
+///
+/// Performance-oriented backends (vectorized CPU, GPU) should be separate types
+/// conforming to `VectorCompute`, not forks of index logic. Compare them against
+/// this type or `VectorDistance` when adding them.
 public struct PortableCPUCompute: VectorCompute {
     public init() {}
 
@@ -27,6 +36,7 @@ public struct PortableCPUCompute: VectorCompute {
         if count == 0 {
             return []
         }
+        // Empty dimensionality: each "row" is an empty vector; distance is well-defined.
         if dim == 0 {
             return try (0..<count).map { _ in
                 try VectorDistance.distance(query, [], metric: metric)

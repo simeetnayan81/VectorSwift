@@ -12,6 +12,10 @@ let package = Package(
             name: "VectorSwift",
             targets: ["VectorSwift"]
         ),
+        .executable(
+            name: "VectorSwiftExample",
+            targets: ["VectorSwiftExample"]
+        ),
     ],
     targets: [
         .target(
@@ -42,6 +46,11 @@ let package = Package(
                 "VectorSwiftQuery",
             ],
             path: "Sources/VectorSwift"
+        ),
+        .executableTarget(
+            name: "VectorSwiftExample",
+            dependencies: ["VectorSwift"],
+            path: "Examples/QuickStart"
         ),
         .testTarget(
             name: "VectorSwiftTests",

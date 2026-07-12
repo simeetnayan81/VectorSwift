@@ -1,6 +1,6 @@
-/// Shared validation for ids and vectors.
+/// Shared validation and vector transforms used by collections and the public API.
 public enum VectorValidation {
-    /// Validates a public point id.
+    /// Ensures a point id is non-empty and within the UTF-8 byte limit.
     public static func requirePointID(_ id: PointID) throws {
         if id.isEmpty {
             throw VectorSwiftError.invalidPointID(id)
@@ -10,7 +10,7 @@ public enum VectorValidation {
         }
     }
 
-    /// Validates collection name length and non-emptiness.
+    /// Ensures a collection name is non-empty and within the UTF-8 byte limit.
     public static func requireCollectionName(_ name: String) throws {
         if name.isEmpty {
             throw VectorSwiftError.invalidArgument("Collection name must not be empty")
@@ -22,14 +22,17 @@ public enum VectorValidation {
         }
     }
 
-    /// Validates vector length against collection dimension.
+    /// Ensures `vector.count == expected`.
     public static func requireDimension(_ vector: [Float], expected: Int) throws {
         if vector.count != expected {
             throw VectorSwiftError.invalidDimension(expected: expected, actual: vector.count)
         }
     }
 
-    /// L2-normalizes `vector`. Throws `zeroVectorNotAllowed` if the norm is zero.
+    /// Returns an L2-normalized copy of `vector`.
+    ///
+    /// - Throws: `VectorSwiftError.zeroVectorNotAllowed` if the Euclidean norm is zero
+    ///   (normalization would be undefined).
     public static func normalized(_ vector: [Float]) throws -> [Float] {
         var sumSquares: Float = 0
         for x in vector {

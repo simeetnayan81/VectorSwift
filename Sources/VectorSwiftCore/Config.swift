@@ -1,17 +1,23 @@
-/// Index family selected for a collection.
+/// Index structure used to accelerate search inside a collection.
+///
+/// Only `.flat` (exact scan) is implemented. Other cases may appear in configuration
+/// for forward compatibility but collection creation will reject unsupported values.
 public enum IndexConfig: String, Sendable, Codable, Equatable, CaseIterable {
     case flat
     case hnsw
 }
 
-/// Parameters for hierarchical NSW graph construction and search.
+/// Parameters for hierarchical NSW graph indexes.
+///
+/// Used when an approximate graph index is available. Defaults match common practice
+/// (M=16, efConstruction=200, efSearch=64; layer-0 max degree defaults to `2 * m`).
 public struct HNSWParams: Sendable, Codable, Equatable {
     public var m: Int
     public var efConstruction: Int
     public var efSearch: Int
     /// Max degree on layer 0. When `nil`, effective value is `2 * m`.
     public var maxM0: Int?
-    /// Optional RNG seed for deterministic level assignment (tests).
+    /// Optional RNG seed so level assignment can be repeated in tests.
     public var seed: UInt64?
 
     public init(
@@ -30,13 +36,13 @@ public struct HNSWParams: Sendable, Codable, Equatable {
 
     public static let `default` = HNSWParams()
 
-    /// Resolved layer-0 max degree.
+    /// Resolved layer-0 maximum degree.
     public var resolvedMaxM0: Int {
         maxM0 ?? (m * 2)
     }
 }
 
-/// How aggressively writes are forced to stable storage.
+/// How aggressively writes are forced to stable storage once durability exists.
 public enum DurabilityLevel: String, Sendable, Codable, Equatable, CaseIterable {
     /// Memory-first; best-effort flush. May lose recent acks on crash.
     case relaxed
@@ -46,12 +52,13 @@ public enum DurabilityLevel: String, Sendable, Codable, Equatable, CaseIterable 
     case strict
 }
 
-/// Which distance backend to use.
+/// Preferred distance backend for a database instance.
 public enum ComputeBackendPreference: String, Sendable, Codable, Equatable, CaseIterable {
-    /// Prefer MLX when available and the batch is large enough; otherwise CPU.
+    /// Prefer an accelerated backend when available and beneficial; otherwise CPU.
     case auto
+    /// Always use the portable CPU implementation.
     case cpu
-    /// Require MLX; fail if unavailable.
+    /// Require an MLX (or equivalent) backend; fail if unavailable.
     case mlx
 }
 
@@ -61,7 +68,7 @@ public struct CollectionConfig: Sendable, Codable, Equatable {
     public var dimension: Int
     public var metric: DistanceMetric
     public var index: IndexConfig
-    /// When true, vectors are L2-normalized on upsert.
+    /// When true, vectors are L2-normalized on upsert (and queries on search).
     public var normalizeVectors: Bool
     public var hnsw: HNSWParams?
 
@@ -83,6 +90,10 @@ public struct CollectionConfig: Sendable, Codable, Equatable {
 }
 
 /// Database-wide runtime configuration.
+///
+/// Segment size and durability fields are stored for API stability and will apply
+/// when on-disk segments and WAL are enabled. `compute` selects the distance backend
+/// shared by collections created through the database.
 public struct DatabaseConfig: Sendable, Codable, Equatable {
     public var durability: DurabilityLevel
     public var compute: ComputeBackendPreference

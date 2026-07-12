@@ -13,3 +13,7 @@ xcuserdata/
 .DS_Store
 *~
 .*.swp
+
+# Editors
+.vscode/
+.idea/
