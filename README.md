@@ -8,12 +8,13 @@ in applications and Swift services.
 
 ## Status
 
-- **In-memory** storage (data does not persist across process restarts)
-- **Exact** search (`flat` index)
-- Multi-collection `Database` API
+- Multi-collection `Database` API with **exact** (`flat`) search
 - Metrics: Euclidean (L2 / L2²), inner product, cosine
+- Optional on-disk **catalog metadata** when you open with a directory path
+  (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
+- **Point data** is still in-memory only (not written to segments/WAL yet)
 
-Approximate indexes, on-disk durability, metadata filters, and GPU acceleration
+Approximate indexes, full durable vectors, metadata filters, and GPU acceleration
 are not available yet.
 
 ## Requirements
@@ -42,10 +43,19 @@ swift run VectorSwiftExample
 
 Source: [`Examples/QuickStart`](Examples/QuickStart).
 
+It opens a **database root directory** (your on-disk `{root}`), creates a collection,
+runs a search, then reopens the same path so you can see that **catalog meta**
+survives while **vectors** do not yet.
+
 ```swift
+import Foundation
 import VectorSwift
 
-let db = try await Database.open()
+// {root} — directory that will hold DB_META.json, CATALOG.json, collections/
+let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("VectorSwift-Example-DB", isDirectory: true)
+
+let db = try await Database.open(path: root)
 
 try await db.createCollection(
     CollectionConfig(
@@ -72,6 +82,22 @@ for hit in results {
 }
 
 try await db.close()
+
+// Reopen the same root: collection list/config reload from disk; points are empty for now.
+let again = try await Database.open(path: root)
+print(try await again.listCollections())
+try await again.close()
+```
+
+On disk after the first run:
+
+```
+{root}/
+  DB_META.json
+  CATALOG.json
+  collections/
+    documents/
+      COLL_META.json
 ```
 
 ## Notes
@@ -81,7 +107,7 @@ try await db.close()
 | Index types | Only `flat` is supported. Creating a collection with `hnsw` fails. |
 | Distance | Always **smaller = closer** (inner product is negated for ranking). |
 | Filters | `SearchRequest.filter` is stored on the request type but not applied. |
-| Path | `Database.open(path:)` may create a directory; vectors are not loaded or saved yet. |
+| Path | `Database.open(path:)` uses that directory as the DB root for catalog meta. |
 | Import | Use `import VectorSwift`. |
 
 ## License

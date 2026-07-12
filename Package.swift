@@ -23,6 +23,11 @@ let package = Package(
             path: "Sources/VectorSwiftCore"
         ),
         .target(
+            name: "VectorSwiftStorage",
+            dependencies: ["VectorSwiftCore"],
+            path: "Sources/VectorSwiftStorage"
+        ),
+        .target(
             name: "VectorSwiftCompute",
             dependencies: ["VectorSwiftCore"],
             path: "Sources/VectorSwiftCompute"
@@ -41,6 +46,7 @@ let package = Package(
             name: "VectorSwift",
             dependencies: [
                 "VectorSwiftCore",
+                "VectorSwiftStorage",
                 "VectorSwiftCompute",
                 "VectorSwiftIndex",
                 "VectorSwiftQuery",
@@ -58,6 +64,7 @@ let package = Package(
                 "VectorSwift",
                 "VectorSwiftCompute",
                 "VectorSwiftIndex",
+                "VectorSwiftStorage",
             ],
             path: "Tests/VectorSwiftTests"
         ),
