@@ -25,7 +25,12 @@ let package = Package(
         .target(
             name: "VectorSwiftStorage",
             dependencies: ["VectorSwiftCore"],
-            path: "Sources/VectorSwiftStorage"
+            path: "Sources/VectorSwiftStorage",
+            // System zlib for IEEE CRC-32 (and future optional deflate if design adds it).
+            // Not a SwiftPM package — links OS libz (macOS/iOS/Linux).
+            linkerSettings: [
+                .linkedLibrary("z"),
+            ]
         ),
         .target(
             name: "VectorSwiftCompute",

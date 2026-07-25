@@ -12,26 +12,50 @@ in applications and Swift services.
 - Metrics: Euclidean (L2 / L2²), inner product, cosine
 - Optional on-disk **catalog metadata** when you open with a directory path
   (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
-- **Point data** is still in-memory only (not written to segments/WAL yet)
+- Binary segment formats for sealed vectors (`VECTORS.bin` / `IDS.bin`) with
+  IEEE CRC-32 integrity (system zlib) — not yet wired into collection upserts
+- **Point data** is still in-memory only (WAL / seal path not finished)
 
 Approximate indexes, full durable vectors, metadata filters, and GPU acceleration
 are not available yet.
 
 ## Requirements
 
-- macOS with full **Xcode** (not Command Line Tools alone)
+- macOS with full **Xcode** (not Command Line Tools alone), **or** Linux with
+  Swift 5.10+ and `libz` (for CRC-32)
 - Swift 5.10+
 
 ```bash
+# macOS — point at full Xcode so XCTest is available
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 ```
 
 ## Build & test
 
+Preferred (same checks as CI before merge):
+
 ```bash
+./scripts/check.sh
+```
+
+Or individually:
+
+```bash
+./scripts/test.sh          # swift test
 swift build
 swift test
 ```
+
+### Continuous integration
+
+Pull requests and pushes to `main` run [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+| Job | Runner | What runs |
+| --- | --- | --- |
+| macOS | `macos-15` + Xcode | `./scripts/check.sh` (debug/release build + tests + example) |
+| Linux | `ubuntu-latest` + Swift 5.10 | Same script (CPU path; links system `libz`) |
+
+Merge only when both jobs are green.
 
 ## Example
 
