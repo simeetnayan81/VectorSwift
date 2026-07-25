@@ -22,8 +22,9 @@ are not available yet.
 ## Requirements
 
 - macOS with full **Xcode** (not Command Line Tools alone), **or** Linux with
-  Swift 5.10+ and `libz` (for CRC-32)
+  Swift 5.10+ and zlib development headers (`libz-dev` / `zlib-devel`) for CRC-32
 - Swift 5.10+
+- On Linux: `pkg-config` recommended so SwiftPM can resolve the `CZlib` system library
 
 ```bash
 # macOS — point at full Xcode so XCTest is available

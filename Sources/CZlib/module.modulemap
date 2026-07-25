@@ -1,0 +1,7 @@
+// System zlib (libz) for Linux and other platforms where `import zlib` is not a
+// built-in Clang module. macOS/iOS also resolve this via the SDK + link `z`.
+module CZlib [system] {
+    header "shim.h"
+    link "z"
+    export *
+}

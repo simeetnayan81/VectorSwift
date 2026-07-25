@@ -22,12 +22,22 @@ let package = Package(
             name: "VectorSwiftCore",
             path: "Sources/VectorSwiftCore"
         ),
+        // OS libz (IEEE crc32). Linux has no built-in `import zlib` module; this
+        // system library + shim provides one. Still not a SwiftPM package dep.
+        .systemLibrary(
+            name: "CZlib",
+            path: "Sources/CZlib",
+            pkgConfig: "zlib",
+            providers: [
+                .apt(["zlib1g-dev"]),
+                .yum(["zlib-devel"]),
+                .brew(["zlib"]),
+            ]
+        ),
         .target(
             name: "VectorSwiftStorage",
-            dependencies: ["VectorSwiftCore"],
+            dependencies: ["VectorSwiftCore", "CZlib"],
             path: "Sources/VectorSwiftStorage",
-            // System zlib for IEEE CRC-32 (and future optional deflate if design adds it).
-            // Not a SwiftPM package — links OS libz (macOS/iOS/Linux).
             linkerSettings: [
                 .linkedLibrary("z"),
             ]

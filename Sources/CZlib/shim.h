@@ -1,0 +1,6 @@
+#ifndef VECTORSWIFT_CZLIB_SHIM_H
+#define VECTORSWIFT_CZLIB_SHIM_H
+
+#include <zlib.h>
+
+#endif /* VECTORSWIFT_CZLIB_SHIM_H */

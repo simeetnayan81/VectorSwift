@@ -1,10 +1,11 @@
 import Foundation
-import zlib
+import CZlib
 
 /// IEEE CRC-32 (ISO 3309 / ITU-T V.42) via system **zlib** (`crc32`).
 ///
 /// Used for on-disk integrity: `VECTORS.bin` / `IDS.bin` trailers (S12), and per-record
-/// checksums in the WAL (S13+). Not a SwiftPM package dependency — links the OS `libz`.
+/// checksums in the WAL (S13+). Links OS `libz` through the `CZlib` system module
+/// (portable on Linux where bare `import zlib` is unavailable).
 ///
 /// Polynomial matches the common check vector `"123456789"` → `0xCBF43926`.
 public enum CRC32 {

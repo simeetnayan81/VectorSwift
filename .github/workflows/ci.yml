@@ -54,7 +54,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libz-dev
+          # zlib headers + pkg-config metadata for SwiftPM systemLibrary(CZlib)
+          sudo apt-get install -y --no-install-recommends libz-dev pkg-config
 
       - name: Install Swift
         uses: swift-actions/setup-swift@v2
