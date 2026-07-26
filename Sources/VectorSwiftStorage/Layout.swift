@@ -8,6 +8,7 @@ import Foundation
 ///   CATALOG.json
 ///   collections/{name}/
 ///     COLL_META.json
+///     wal/wal.log
 ///     segments/{segmentId}/
 ///       VECTORS.bin
 ///       IDS.bin
@@ -38,6 +39,16 @@ public struct DatabaseLayout: Sendable {
     public func collectionMeta(name: String) -> URL {
         collectionDirectory(name: name)
             .appendingPathComponent("COLL_META.json", isDirectory: false)
+    }
+
+    public func walDirectory(collection: String) -> URL {
+        collectionDirectory(name: collection)
+            .appendingPathComponent("wal", isDirectory: true)
+    }
+
+    public func walLog(collection: String) -> URL {
+        walDirectory(collection: collection)
+            .appendingPathComponent("wal.log", isDirectory: false)
     }
 
     public func segmentsDirectory(collection: String) -> URL {

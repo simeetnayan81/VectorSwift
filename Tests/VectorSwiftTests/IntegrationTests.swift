@@ -29,7 +29,7 @@ final class IntegrationTests: XCTestCase {
         try await docs.upsert([
             Point(id: "a", vector: [1, 0], payload: ["k": .string("replaced")]),
         ])
-        await docs.delete(ids: ["b"])
+        try await docs.delete(ids: ["b"])
 
         let got = await docs.get(ids: ["a"], withVector: true)
         XCTAssertEqual(got.count, 1)

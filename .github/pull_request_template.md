@@ -7,7 +7,7 @@
 - [ ] `./scripts/check.sh` passes locally
 - [ ] CI (macOS + Linux) is green
 - [ ] Tests cover new behavior / edge cases
-- [ ] No secrets or `.local/` planning docs committed
+- [ ] No secrets committed
 - [ ] README updated if user-facing behavior changed
 
 ## Test plan
