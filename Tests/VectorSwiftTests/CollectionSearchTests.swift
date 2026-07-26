@@ -77,7 +77,7 @@ final class CollectionSearchTests: XCTestCase {
             Point(id: "keep", vector: [2, 0]),
             Point(id: "gone", vector: [0, 0]),
         ])
-        await col.delete(ids: ["gone"])
+        try await col.delete(ids: ["gone"])
         let hits = try await col.search(SearchRequest(vector: [0, 0], k: 5))
         XCTAssertEqual(hits.map(\.id), ["keep"])
     }

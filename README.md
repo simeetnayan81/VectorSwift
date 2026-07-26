@@ -10,14 +10,14 @@ in applications and Swift services.
 
 - Multi-collection `Database` API with **exact** (`flat`) search
 - Metrics: Euclidean (L2 / L2²), inner product, cosine
-- Optional on-disk **catalog metadata** when you open with a directory path
-  (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
+- Optional on-disk root when you open with a directory path:
+  catalog metadata (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
+  plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes survive reopen
 - Binary segment formats for sealed vectors (`VECTORS.bin` / `IDS.bin`) with
-  IEEE CRC-32 integrity (system zlib) — not yet wired into collection upserts
-- **Point data** is still in-memory only (WAL / seal path not finished)
+  IEEE CRC-32 integrity (system zlib) — used later for seal (not yet on the hot path)
+- Sealed segments / MANIFEST multi-segment search not finished yet
 
-Approximate indexes, full durable vectors, metadata filters, and GPU acceleration
-are not available yet.
+Approximate indexes, metadata filters, and GPU acceleration are not available yet.
 
 ## Requirements
 
@@ -69,8 +69,8 @@ swift run VectorSwiftExample
 Source: [`Examples/QuickStart`](Examples/QuickStart).
 
 It opens a **database root directory** (your on-disk `{root}`), creates a collection,
-runs a search, then reopens the same path so you can see that **catalog meta**
-survives while **vectors** do not yet.
+runs a search, then reopens the same path so you can see that **catalog meta and
+points** (via WAL) survive.
 
 ```swift
 import Foundation
@@ -108,9 +108,11 @@ for hit in results {
 
 try await db.close()
 
-// Reopen the same root: collection list/config reload from disk; points are empty for now.
+// Reopen the same root: collection list/config and points reload from disk (WAL).
 let again = try await Database.open(path: root)
 print(try await again.listCollections())
+let reopened = try await again.collection(name: "documents")
+print(await reopened.count()) // 3
 try await again.close()
 ```
 
@@ -123,6 +125,8 @@ On disk after the first run:
   collections/
     documents/
       COLL_META.json
+      wal/
+        wal.log
 ```
 
 ## Notes

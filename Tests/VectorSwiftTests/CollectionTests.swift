@@ -65,7 +65,7 @@ final class CollectionTests: XCTestCase {
             Point(id: "a", vector: [1, 0, 0]),
             Point(id: "b", vector: [0, 1, 0]),
         ])
-        await col.delete(ids: ["a"])
+        try await col.delete(ids: ["a"])
         let live = await col.count()
         let withTomb = await col.count(includeTombstones: true)
         XCTAssertEqual(live, 1)
@@ -77,7 +77,7 @@ final class CollectionTests: XCTestCase {
     func testDeleteUnknownIdIsNoOp() async throws {
         let col = try makeCollection()
         try await col.upsert([Point(id: "a", vector: [1, 0, 0])])
-        await col.delete(ids: ["nope"])
+        try await col.delete(ids: ["nope"])
         let live = await col.count()
         let withTomb = await col.count(includeTombstones: true)
         XCTAssertEqual(live, 1)
@@ -157,7 +157,7 @@ final class CollectionTests: XCTestCase {
     func testCheckpointNoOp() async throws {
         let col = try makeCollection()
         try await col.upsert([Point(id: "a", vector: [1, 0, 0])])
-        await col.checkpoint()
+        try await col.checkpoint()
         let live = await col.count()
         XCTAssertEqual(live, 1)
     }

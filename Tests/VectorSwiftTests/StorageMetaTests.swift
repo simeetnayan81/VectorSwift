@@ -51,7 +51,7 @@ final class StorageMetaTests: XCTestCase {
         XCTAssertEqual(docsConfig.metric, .cosine)
         XCTAssertTrue(docsConfig.normalizeVectors)
 
-        // Points are not durable yet — reopened collection is empty.
+        // No points were upserted in this test — reopened collection is empty.
         let count = await docs.count()
         XCTAssertEqual(count, 0)
 

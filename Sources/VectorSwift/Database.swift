@@ -8,15 +8,14 @@ import VectorSwiftStorage
 /// ## Responsibilities
 /// - Own a catalog of named `Collection` instances.
 /// - Apply database-wide settings (`DatabaseConfig`), including which distance
-///   backend newly created collections receive.
+///   backend newly created collections receive and durability for WAL writes.
 /// - Provide lifecycle operations: open, create/drop/list collections, checkpoint, close.
 ///
 /// ## Persistence modes
 /// - **No path** (`open()`): purely in-memory. Closing drops the catalog; nothing on disk.
 /// - **With path** (`open(path:)`): writes and reloads catalog metadata under that directory
 ///   (`DB_META.json`, `CATALOG.json`, `collections/*/COLL_META.json`). Collection **points**
-///   are still held only in memory until segment/WAL storage is implemented; reopening
-///   restores collection definitions (empty of vectors).
+///   are recorded in per-collection `wal/wal.log` and restored on reopen (S13).
 ///
 /// ## Concurrency
 /// `Database` is an actor. Catalog mutations are serialized here; point-level
@@ -43,10 +42,10 @@ public actor Database {
     /// Opens a database.
     ///
     /// - Parameters:
-    ///   - path: Optional working directory. When set, meta files are created/loaded there.
+    ///   - path: Optional working directory. When set, meta files and WALs live there.
     ///   - config: Used for a **new** on-disk database, or for pure in-memory mode.
     ///     If `path` already contains `DB_META.json`, the on-disk config is used instead.
-    /// - Throws: `backendUnavailable`, `corrupted` for invalid meta JSON, or I/O errors.
+    /// - Throws: `backendUnavailable`, `corrupted` for invalid meta/WAL, or I/O errors.
     public static func open(
         path: URL? = nil,
         config: DatabaseConfig = .default
@@ -79,7 +78,11 @@ public actor Database {
             resolvedConfig = meta.config
             // Re-resolve compute from on-disk config (open() may have passed defaults).
             let diskCompute = try makeCompute(preference: resolvedConfig.compute)
-            let loaded = try loadCollections(layout: layout, compute: diskCompute)
+            let loaded = try loadCollections(
+                layout: layout,
+                compute: diskCompute,
+                durability: resolvedConfig.durability
+            )
             return Database(
                 layout: layout,
                 config: resolvedConfig,
@@ -112,13 +115,14 @@ public actor Database {
 
     /// Creates a new empty collection and registers it in the catalog.
     ///
-    /// With an on-disk root, also writes `COLL_META.json` and updates `CATALOG.json`.
+    /// With an on-disk root, also writes `COLL_META.json`, updates `CATALOG.json`,
+    /// and attaches a per-collection write-ahead log for durable mutations.
     public func createCollection(_ config: CollectionConfig) throws {
         try ensureOpen()
         if collections[config.name] != nil {
             throw VectorSwiftError.collectionExists(config.name)
         }
-        let collection = try Collection(config: config, compute: compute)
+        let collection = try makeCollection(config: config)
         collections[config.name] = collection
 
         if let layout {
@@ -128,7 +132,8 @@ public actor Database {
 
     /// Removes a collection from the catalog.
     ///
-    /// With an on-disk root, updates `CATALOG.json` and deletes the collection directory.
+    /// With an on-disk root, updates `CATALOG.json` and deletes the collection directory
+    /// (including WAL and any future segment files).
     public func dropCollection(name: String) throws {
         try ensureOpen()
         guard collections.removeValue(forKey: name) != nil else {
@@ -159,13 +164,13 @@ public actor Database {
     public func checkpoint() async throws {
         try ensureOpen()
         for collection in collections.values {
-            await collection.checkpoint()
+            try await collection.checkpoint()
         }
     }
 
     /// Closes the database and clears the in-memory catalog.
     ///
-    /// On-disk meta files (if any) remain on disk for a later `open(path:)`.
+    /// On-disk meta and WAL files (if any) remain on disk for a later `open(path:)`.
     /// Calling `close` again throws `closed`.
     public func close() throws {
         if isClosed {
@@ -181,6 +186,21 @@ public actor Database {
         if isClosed {
             throw VectorSwiftError.closed
         }
+    }
+
+    private func makeCollection(config: CollectionConfig) throws -> Collection {
+        let wal: WriteAheadLog?
+        if let layout {
+            wal = WriteAheadLog(url: layout.walLog(collection: config.name))
+        } else {
+            wal = nil
+        }
+        return try Collection(
+            config: config,
+            compute: compute,
+            durability: databaseConfig.durability,
+            wal: wal
+        )
     }
 
     private static func makeCompute(
@@ -205,7 +225,8 @@ public actor Database {
 
     private static func loadCollections(
         layout: DatabaseLayout,
-        compute: any VectorCompute
+        compute: any VectorCompute,
+        durability: DurabilityLevel
     ) throws -> [String: Collection] {
         guard JSONFileStore.exists(layout.catalog) else {
             throw VectorSwiftError.corrupted(
@@ -233,7 +254,13 @@ public actor Database {
                     reason: "Collection name mismatch: catalog '\(name)' vs meta '\(meta.config.name)'"
                 )
             }
-            let collection = try Collection(config: meta.config, compute: compute)
+            let wal = WriteAheadLog(url: layout.walLog(collection: name))
+            let collection = try Collection(
+                config: meta.config,
+                compute: compute,
+                durability: durability,
+                wal: wal
+            )
             result[name] = collection
         }
         return result

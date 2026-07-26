@@ -1,11 +1,11 @@
 import Foundation
 import VectorSwift
 
-/// Sample app: open a database directory, search, then reopen to show catalog meta on disk.
+/// Sample app: open a database directory, search, then reopen to show durable points via WAL.
 @main
 struct QuickStart {
     static func main() async throws {
-        // Database root directory (the {root} in docs). Meta files live under this path.
+        // Database root directory (the {root} in docs). Meta + WAL live under this path.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("VectorSwift-Example-DB", isDirectory: true)
 
@@ -14,10 +14,14 @@ struct QuickStart {
         print("  \(root.path)/DB_META.json")
         print("  \(root.path)/CATALOG.json")
         print("  \(root.path)/collections/<name>/COLL_META.json")
+        print("  \(root.path)/collections/<name>/wal/wal.log")
         print("")
 
         // First open: creates the directory and writes meta when collections are created.
-        var db = try await Database.open(path: root)
+        var db = try await Database.open(
+            path: root,
+            config: DatabaseConfig(durability: .strict, compute: .cpu)
+        )
 
         let collectionName = "documents"
         let existing = try await db.listCollections()
@@ -37,7 +41,7 @@ struct QuickStart {
 
         let documents = try await db.collection(name: collectionName)
 
-        // Point data is still in-memory only for this open session.
+        // Upserts append to the collection WAL so they survive reopen.
         try await documents.upsert([
             Point(
                 id: "intro",
@@ -77,15 +81,20 @@ struct QuickStart {
 
         try await db.close()
 
-        // Reopen the same root: collection definitions come back from disk meta.
-        // Upserted vectors do not (not written to segments yet).
+        // Reopen the same root: catalog meta + WAL replay restore points.
         db = try await Database.open(path: root)
         let names = try await db.listCollections()
         print("")
         print("After reopen, collections on disk: \(names)")
         let reopened = try await db.collection(name: collectionName)
         let liveCount = await reopened.count()
-        print("Live points after reopen (expect 0 until vector durability): \(liveCount)")
+        print("Live points after reopen (via WAL): \(liveCount)")
+        let again = try await reopened.search(
+            SearchRequest(vector: [1, 0.05, 0], k: 1, withPayload: true)
+        )
+        if let top = again.first {
+            print("Top hit after reopen: \(top.id) distance=\(top.distance)")
+        }
         try await db.close()
 
         print("")
