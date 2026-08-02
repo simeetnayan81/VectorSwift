@@ -8,10 +8,13 @@ import Foundation
 ///   CATALOG.json
 ///   collections/{name}/
 ///     COLL_META.json
+///     MANIFEST.json
 ///     wal/wal.log
 ///     segments/{segmentId}/
 ///       VECTORS.bin
 ///       IDS.bin
+///       PAYLOAD.bin
+///       SEGMENT_META.json
 /// ```
 public struct DatabaseLayout: Sendable {
     public let root: URL
@@ -39,6 +42,11 @@ public struct DatabaseLayout: Sendable {
     public func collectionMeta(name: String) -> URL {
         collectionDirectory(name: name)
             .appendingPathComponent("COLL_META.json", isDirectory: false)
+    }
+
+    public func manifest(collection: String) -> URL {
+        collectionDirectory(name: collection)
+            .appendingPathComponent("MANIFEST.json", isDirectory: false)
     }
 
     public func walDirectory(collection: String) -> URL {
@@ -69,5 +77,15 @@ public struct DatabaseLayout: Sendable {
     public func idsBin(collection: String, segmentId: UInt64) -> URL {
         segmentDirectory(collection: collection, segmentId: segmentId)
             .appendingPathComponent("IDS.bin", isDirectory: false)
+    }
+
+    public func payloadBin(collection: String, segmentId: UInt64) -> URL {
+        segmentDirectory(collection: collection, segmentId: segmentId)
+            .appendingPathComponent("PAYLOAD.bin", isDirectory: false)
+    }
+
+    public func segmentMeta(collection: String, segmentId: UInt64) -> URL {
+        segmentDirectory(collection: collection, segmentId: segmentId)
+            .appendingPathComponent("SEGMENT_META.json", isDirectory: false)
     }
 }

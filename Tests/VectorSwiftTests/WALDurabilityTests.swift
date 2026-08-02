@@ -212,7 +212,7 @@ final class WALDurabilityTests: XCTestCase {
         try await db.close()
     }
 
-    func testCheckpointWritesMark() async throws {
+    func testCheckpointSealsUnsealedDataAndReclaimsWAL() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -225,14 +225,15 @@ final class WALDurabilityTests: XCTestCase {
         try await db.checkpoint()
         try await db.close()
 
-        let wal = WriteAheadLog(url: DatabaseLayout(root: root).walLog(collection: "docs"))
-        let records = try wal.readAllValidRecords()
-        XCTAssertTrue(records.contains(.checkpointMark))
-        let upserts = records.filter {
-            if case .upsert = $0 { return true }
-            return false
-        }
-        XCTAssertEqual(upserts.count, 1)
+        let layout = DatabaseLayout(root: root)
+        // Seal reclaims WAL; durable base is MANIFEST + segment files.
+        let wal = WriteAheadLog(url: layout.walLog(collection: "docs"))
+        XCTAssertTrue(try wal.readAllValidRecords().isEmpty)
+        let manifest = try JSONFileStore.read(
+            ManifestDocument.self,
+            from: layout.manifest(collection: "docs")
+        )
+        XCTAssertEqual(manifest.segmentIds.count, 1)
     }
 
     func testBatchUpsertAllPresentAfterReopen() async throws {
@@ -312,7 +313,7 @@ final class WALDurabilityTests: XCTestCase {
         try await reopened.close()
     }
 
-    func testRelaxedCheckpointMarkAndDataSurvive() async throws {
+    func testRelaxedCheckpointSealsAndDataSurviveFromSegments() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -325,18 +326,17 @@ final class WALDurabilityTests: XCTestCase {
         try await db.checkpoint()
         try await db.close()
 
-        let wal = WriteAheadLog(url: DatabaseLayout(root: root).walLog(collection: "docs"))
-        let records = try wal.readAllValidRecords()
-        XCTAssertTrue(records.contains(.checkpointMark))
-        XCTAssertTrue(records.contains {
-            if case .upsert(let id, _, _) = $0 { return id == "a" }
-            return false
-        })
+        let layout = DatabaseLayout(root: root)
+        let wal = WriteAheadLog(url: layout.walLog(collection: "docs"))
+        XCTAssertTrue(try wal.readAllValidRecords().isEmpty, "seal reclaims WAL")
+        XCTAssertTrue(JSONFileStore.exists(layout.manifest(collection: "docs")))
 
         let reopened = try await Database.open(path: root)
         let col = try await reopened.collection(name: "docs")
         let countLive = await col.count()
         XCTAssertEqual(countLive, 1)
+        let got = await col.get(ids: ["a"], withVector: true)
+        XCTAssertEqual(got[0].vector, [1, 2])
         try await reopened.close()
     }
 

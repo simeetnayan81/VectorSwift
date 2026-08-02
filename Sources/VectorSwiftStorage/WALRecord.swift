@@ -1,12 +1,44 @@
 import Foundation
 import VectorSwiftCore
 
-/// WAL record type byte values (design §7.3).
+/// WAL record type byte values (design §7.3, ADR-001).
 public enum WALRecordType: UInt8, Sendable, Equatable {
     case upsert = 1
     case delete = 2
     case checkpointMark = 3
+    /// Legacy seal placeholder (segment id only). Writers emit ``sealSegmentV2``.
     case sealSegment = 4
+    /// Seal with checksums (mutable segment flush).
+    case sealSegmentV2 = 5
+}
+
+/// Checksums and identity for a sealed segment (WAL type 5 payload).
+public struct WALSealSegmentV2Payload: Equatable, Sendable {
+    public var segmentId: UInt64
+    public var rowCount: UInt64
+    public var vectorsCrc32: UInt32
+    public var idsCrc32: UInt32
+    public var payloadsCrc32: UInt32
+    public var flags: UInt32
+
+    public init(
+        segmentId: UInt64,
+        rowCount: UInt64,
+        vectorsCrc32: UInt32,
+        idsCrc32: UInt32,
+        payloadsCrc32: UInt32,
+        flags: UInt32 = 0
+    ) {
+        self.segmentId = segmentId
+        self.rowCount = rowCount
+        self.vectorsCrc32 = vectorsCrc32
+        self.idsCrc32 = idsCrc32
+        self.payloadsCrc32 = payloadsCrc32
+        self.flags = flags
+    }
+
+    /// On-disk payload size: 8+8+4+4+4+4.
+    public static let byteCount = 32
 }
 
 /// One logical write-ahead log operation.
@@ -25,8 +57,10 @@ public enum WALRecord: Equatable, Sendable {
     case delete(ids: [PointID])
     /// Marks a durability checkpoint (no payload in v1).
     case checkpointMark
-    /// Reserved for seal pipeline (S15+); segment id only for now.
+    /// Legacy seal placeholder (segment id only). Prefer ``sealSegmentV2``.
     case sealSegment(segmentId: UInt64)
+    /// Seal record with segment checksums (full snapshot seal).
+    case sealSegmentV2(WALSealSegmentV2Payload)
 
     public var recordType: WALRecordType {
         switch self {
@@ -34,6 +68,7 @@ public enum WALRecord: Equatable, Sendable {
         case .delete: return .delete
         case .checkpointMark: return .checkpointMark
         case .sealSegment: return .sealSegment
+        case .sealSegmentV2: return .sealSegmentV2
         }
     }
 }
@@ -178,6 +213,16 @@ public enum WALCodec {
             var data = Data()
             BinaryIO.appendUInt64(segmentId, to: &data)
             return data
+        case .sealSegmentV2(let seal):
+            var data = Data()
+            data.reserveCapacity(WALSealSegmentV2Payload.byteCount)
+            BinaryIO.appendUInt64(seal.segmentId, to: &data)
+            BinaryIO.appendUInt64(seal.rowCount, to: &data)
+            BinaryIO.appendUInt32(seal.vectorsCrc32, to: &data)
+            BinaryIO.appendUInt32(seal.idsCrc32, to: &data)
+            BinaryIO.appendUInt32(seal.payloadsCrc32, to: &data)
+            BinaryIO.appendUInt32(seal.flags, to: &data)
+            return data
         }
     }
 
@@ -209,6 +254,30 @@ public enum WALCodec {
             var offset = 0
             let segmentId = try BinaryIO.readUInt64(from: payload, at: &offset)
             return .sealSegment(segmentId: segmentId)
+        case .sealSegmentV2:
+            guard payload.count == WALSealSegmentV2Payload.byteCount else {
+                throw VectorSwiftError.corrupted(
+                    path: path,
+                    reason: "WAL seal_segment_v2 payload must be \(WALSealSegmentV2Payload.byteCount) bytes, got \(payload.count)"
+                )
+            }
+            var offset = 0
+            let segmentId = try BinaryIO.readUInt64(from: payload, at: &offset)
+            let rowCount = try BinaryIO.readUInt64(from: payload, at: &offset)
+            let vectorsCrc = try BinaryIO.readUInt32(from: payload, at: &offset)
+            let idsCrc = try BinaryIO.readUInt32(from: payload, at: &offset)
+            let payloadsCrc = try BinaryIO.readUInt32(from: payload, at: &offset)
+            let flags = try BinaryIO.readUInt32(from: payload, at: &offset)
+            return .sealSegmentV2(
+                WALSealSegmentV2Payload(
+                    segmentId: segmentId,
+                    rowCount: rowCount,
+                    vectorsCrc32: vectorsCrc,
+                    idsCrc32: idsCrc,
+                    payloadsCrc32: payloadsCrc,
+                    flags: flags
+                )
+            )
         }
     }
 
