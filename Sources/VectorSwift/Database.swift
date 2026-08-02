@@ -132,13 +132,16 @@ public actor Database {
 
     /// Removes a collection from the catalog.
     ///
-    /// With an on-disk root, updates `CATALOG.json` and deletes the collection directory
-    /// (including WAL and any future segment files).
-    public func dropCollection(name: String) throws {
+    /// Cancels deferred balanced fsync work and rejects further mutations on the
+    /// collection, then updates `CATALOG.json` and deletes the collection directory
+    /// (including WAL). Drop does **not** fsync the WAL — data is discarded.
+    public func dropCollection(name: String) async throws {
         try ensureOpen()
-        guard collections.removeValue(forKey: name) != nil else {
+        guard let collection = collections.removeValue(forKey: name) else {
             throw VectorSwiftError.collectionNotFound(name)
         }
+        // Canonical drop path: cancel timer + stop mutations; no fsync (S14).
+        try await collection.prepareForClose(syncWAL: false)
 
         if let layout {
             try persistDropCollection(name: name, layout: layout)
@@ -168,13 +171,23 @@ public actor Database {
         }
     }
 
-    /// Closes the database and clears the in-memory catalog.
+    /// Closes the database after fsyncing each collection WAL (path-backed).
     ///
-    /// On-disk meta and WAL files (if any) remain on disk for a later `open(path:)`.
-    /// Calling `close` again throws `closed`.
-    public func close() throws {
+    /// For every collection, cancels deferred balanced flushes and
+    /// `try` fsyncs the WAL for **all** durability levels so clean shutdown is a
+    /// durability handoff. On any fsync/I/O failure, the error is thrown, the
+    /// database remains open (`isClosed` stays false), and the catalog is retained
+    /// so the caller can retry `close()`.
+    ///
+    /// On-disk meta and WAL files remain on disk for a later `open(path:)`.
+    /// Calling `close` again after success throws `closed`.
+    public func close() async throws {
         if isClosed {
             throw VectorSwiftError.closed
+        }
+        // Partial failure: earlier collections may already be durable; leave open.
+        for collection in collections.values {
+            try await collection.prepareForClose(syncWAL: true)
         }
         isClosed = true
         collections.removeAll()

@@ -13,6 +13,7 @@ in applications and Swift services.
 - Optional on-disk root when you open with a directory path:
   catalog metadata (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
   plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes survive reopen
+- **Durability levels** (`relaxed` / `balanced` default / `strict`): control when the WAL is fsynced; `checkpoint()` and clean `close()` fsync for all levels
 - Binary segment formats for sealed vectors (`VECTORS.bin` / `IDS.bin`) with
   IEEE CRC-32 integrity (system zlib) — used later for seal (not yet on the hot path)
 - Sealed segments / MANIFEST multi-segment search not finished yet
