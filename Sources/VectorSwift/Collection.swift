@@ -13,11 +13,12 @@ import VectorSwiftStorage
 /// (threshold or `checkpoint`) writes only the overlay (+ epoch tombstones) as a
 /// new segment, **appends** it to `MANIFEST.json`, and reclaims the WAL.
 /// Reopen loads MANIFEST segments in order (later ids win), applies per-segment
-/// tombstones, then replays any post-seal WAL.
+/// tombstones, then replays WAL records **after** the last published seal.
+/// Segment directories not listed in MANIFEST are ignored and removed.
 ///
 /// Ephemeral collections (no path) keep everything in the mutable map.
 ///
-/// ## Durability (S14)
+/// ## Durability
 /// `DurabilityLevel` selects when the process waits for WAL data to reach stable
 /// storage via `FileHandle.synchronize()`. All path-backed levels write WAL
 /// frames before applying memory. See ``DurabilityLevel`` for loss windows.
@@ -64,7 +65,7 @@ public actor Collection {
     private var unsealedPointCount: Int = 0
     private var unsealedByteCount: Int = 0
 
-    // MARK: Durability state (S14)
+    // MARK: Durability state
 
     private var pendingRecordCount: Int = 0
     private var pendingByteCount: Int = 0
@@ -162,11 +163,29 @@ public actor Collection {
                 sealed: &sealed,
                 idIndex: &idIndex
             )
+            let repaired = StorageRecovery.repairedNextSegmentId(
+                persisted: self.nextSegmentId,
+                publishedSegmentIds: sealed.map(\.id)
+            )
+            if repaired != self.nextSegmentId {
+                self.nextSegmentId = repaired
+                try Self.persistCollectionMeta(
+                    layout: layout,
+                    name: config.name,
+                    config: config,
+                    nextSegmentId: repaired
+                )
+            }
         }
 
         if let wal {
             let records = try wal.readAllValidRecords(truncateIncompleteTail: true)
-            for record in records {
+            let start = StorageRecovery.replayStartIndex(
+                records: records,
+                publishedSegmentIds: Set(sealed.map(\.id))
+            )
+            let toReplay = records[start...]
+            for record in toReplay {
                 try Self.applyRecord(
                     record,
                     sealed: sealed,
@@ -178,7 +197,7 @@ public actor Collection {
                     validateDimension: true
                 )
             }
-            if records.contains(where: {
+            if toReplay.contains(where: {
                 switch $0 {
                 case .upsert, .delete: return true
                 default: return false
@@ -558,6 +577,19 @@ public actor Collection {
         guard hasUnsealedData, hasSealableWork else { return }
 
         let segmentId = nextSegmentId
+        nextSegmentId = segmentId + 1
+        do {
+            try Self.persistCollectionMeta(
+                layout: layout,
+                name: name,
+                config: collectionConfig,
+                nextSegmentId: nextSegmentId
+            )
+        } catch {
+            nextSegmentId = segmentId
+            throw error
+        }
+
         let rows: [SealedSegmentIO.Row] = mutable.map { id, entry in
             SealedSegmentIO.Row(id: id, vector: entry.vector, payload: entry.payload)
         }
@@ -604,9 +636,6 @@ public actor Collection {
         try wal.resetEmpty()
         markDurableSuccess()
 
-        nextSegmentId = segmentId + 1
-        try persistCollectionMeta(layout: layout)
-
         var vectors: [Float] = []
         var ids: [PointID] = []
         var payloads: [[String: PayloadValue]] = []
@@ -640,9 +669,14 @@ public actor Collection {
         unsealedByteCount = 0
     }
 
-    private func persistCollectionMeta(layout: DatabaseLayout) throws {
+    private static func persistCollectionMeta(
+        layout: DatabaseLayout,
+        name: String,
+        config: CollectionConfig,
+        nextSegmentId: UInt64
+    ) throws {
         let meta = CollectionMetaDocument(
-            config: collectionConfig,
+            config: config,
             nextSegmentId: nextSegmentId,
             nextRowId: 1
         )
@@ -669,13 +703,29 @@ public actor Collection {
         idIndex: inout [PointID: Location]
     ) throws {
         let manifestURL = layout.manifest(collection: collectionName)
-        guard JSONFileStore.exists(manifestURL) else { return }
+        let manifest: ManifestDocument
+        if JSONFileStore.exists(manifestURL) {
+            let loaded = try JSONFileStore.read(ManifestDocument.self, from: manifestURL)
+            if loaded.formatVersion != StorageFormat.version {
+                throw VectorSwiftError.corrupted(
+                    path: manifestURL.path,
+                    reason: "Unsupported MANIFEST formatVersion \(loaded.formatVersion)"
+                )
+            }
+            manifest = loaded
+        } else {
+            manifest = .empty
+        }
 
-        let manifest = try JSONFileStore.read(ManifestDocument.self, from: manifestURL)
-        if manifest.formatVersion != StorageFormat.version {
-            throw VectorSwiftError.corrupted(
-                path: manifestURL.path,
-                reason: "Unsupported MANIFEST formatVersion \(manifest.formatVersion)"
+        let collectionDir = layout.collectionDirectory(name: collectionName)
+        _ = StorageRecovery.removeUnlistedSegmentDirectories(
+            segmentsDirectory: layout.segmentsDirectory(collection: collectionName),
+            liveSegmentIds: Set(manifest.segmentIds)
+        )
+        _ = StorageRecovery.removeLeftoverTemporaryFiles(in: collectionDir)
+        for segmentId in manifest.segmentIds {
+            _ = StorageRecovery.removeLeftoverTemporaryFiles(
+                in: layout.segmentDirectory(collection: collectionName, segmentId: segmentId)
             )
         }
 
