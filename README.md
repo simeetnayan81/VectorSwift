@@ -62,22 +62,22 @@ Pull requests and pushes to `main` run [`.github/workflows/ci.yml`](.github/work
 | Test (Linux CPU) | `ubuntu-latest` + Swift 5.10 | `./scripts/test.sh` |
 | Test (macOS / MLX) | `macos-15` + Xcode | `./scripts/test.sh` (+ MLX target when `VectorSwiftComputeMLX` exists) |
 | Example (macOS / Linux) | same runners | `./scripts/example.sh` |
-| **CI** | `ubuntu-latest` | Aggregator — green only if every job above succeeded |
+| **macOS (build + test)** | aggregator | Green if all macOS jobs succeeded |
+| **Linux (build + test)** | aggregator | Green if all Linux jobs succeeded |
+| **CI** | aggregator | Green if both OS aggregators succeeded |
 
-Merge only when the **CI** check is green (see branch protection below). Unit tests are a commit gate locally, not only a merge gate.
+Merge when required checks are green. Existing branch protection still uses **macOS (build + test)** and **Linux (build + test)**; those names are posted by the aggregators. You can later require only **CI**.
 
-#### GitHub: require CI before merging to `main`
+Unit tests are a commit gate locally, not only a merge gate.
 
-After this workflow is on `main`, set a ruleset so PRs cannot merge until the aggregator passes:
+#### GitHub: required checks for `main`
 
-1. Repo **Settings → Rules → Rulesets → New ruleset → New branch ruleset**
-2. Target branches: `main`
-3. Enable **Require a pull request before merging**
-4. Enable **Require status checks to pass**
-5. Add required check: **`CI`** (exact job name from the workflow). Do **not** require the old `macOS (build + test)` / `Linux (build + test)` names.
-6. Optional but recommended: **Do not allow bypassing the above settings**; **Require branches to be up to date before merging**
+**Settings → Branches** (or **Rules → Rulesets**), require a PR, then require status checks:
 
-Status check names appear in the ruleset picker only after this workflow has run at least once on the default branch or on a PR.
+- Keep (current): `macOS (build + test)` and `Linux (build + test)` — these now report again.
+- Optional later: add `CI` and drop the two OS names so you only maintain one required check.
+
+Check names appear in the picker after this workflow has run once.
 
 ## Example
 

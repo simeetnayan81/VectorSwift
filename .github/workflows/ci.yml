@@ -173,26 +173,54 @@ jobs:
       - name: Build VectorSwiftExample
         run: ./scripts/example.sh
 
-  # Single required check for branch protection / rulesets.
+  # Names must match existing GitHub required checks (Settings → Branches).
+  # Those rules still expect these strings; the work itself is the split jobs above.
+  macos-build-test:
+    name: macOS (build + test)
+    if: always()
+    needs:
+      - build-macos
+      - test-macos-mlx
+      - example-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: macOS jobs succeeded
+        run: |
+          set -euo pipefail
+          test "${{ needs.build-macos.result }}" = success
+          test "${{ needs.test-macos-mlx.result }}" = success
+          test "${{ needs.example-macos.result }}" = success
+          echo "macOS (build + test) passed."
+
+  linux-build-test:
+    name: Linux (build + test)
+    if: always()
+    needs:
+      - build-linux
+      - test-linux
+      - example-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Linux jobs succeeded
+        run: |
+          set -euo pipefail
+          test "${{ needs.build-linux.result }}" = success
+          test "${{ needs.test-linux.result }}" = success
+          test "${{ needs.example-linux.result }}" = success
+          echo "Linux (build + test) passed."
+
+  # Optional single check if you switch branch protection to just "CI".
   ci:
     name: CI
     if: always()
     needs:
-      - build-macos
-      - build-linux
-      - test-linux
-      - test-macos-mlx
-      - example-macos
-      - example-linux
+      - macos-build-test
+      - linux-build-test
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs succeeded
         run: |
           set -euo pipefail
-          test "${{ needs.build-macos.result }}" = success
-          test "${{ needs.build-linux.result }}" = success
-          test "${{ needs.test-linux.result }}" = success
-          test "${{ needs.test-macos-mlx.result }}" = success
-          test "${{ needs.example-macos.result }}" = success
-          test "${{ needs.example-linux.result }}" = success
+          test "${{ needs.macos-build-test.result }}" = success
+          test "${{ needs.linux-build-test.result }}" = success
           echo "All CI jobs succeeded."
