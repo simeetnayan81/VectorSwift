@@ -100,6 +100,28 @@ public struct WriteAheadLog: Sendable {
         }
     }
 
+    /// Replaces the log with an empty file and fsyncs (post-seal reclaim).
+    public func resetEmpty() throws {
+        try ensureParentDirectory()
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            if let forced = stats?.consumeForcedError() {
+                throw forced
+            }
+            try handle.synchronize()
+            stats?.recordSynchronize()
+        } catch let error as VectorSwiftError {
+            throw error
+        } catch {
+            throw VectorSwiftError.io("Failed to reset WAL at \(url.path): \(error)")
+        }
+    }
+
     // MARK: - Read / recover
 
     /// Reads all complete valid records. Truncates an incomplete tail when requested.

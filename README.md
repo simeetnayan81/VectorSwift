@@ -14,9 +14,10 @@ in applications and Swift services.
   catalog metadata (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
   plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes survive reopen
 - **Durability levels** (`relaxed` / `balanced` default / `strict`): control when the WAL is fsynced; `checkpoint()` and clean `close()` fsync for all levels
-- Binary segment formats for sealed vectors (`VECTORS.bin` / `IDS.bin`) with
-  IEEE CRC-32 integrity (system zlib) — used later for seal (not yet on the hot path)
-- Sealed segments / MANIFEST multi-segment search not finished yet
+- **Seal**: `checkpoint()` / size thresholds flush live points to sealed segment files
+  (`VECTORS.bin` / `IDS.bin` / `PAYLOAD.bin` + `SEGMENT_META.json`), publish `MANIFEST.json`,
+  and reclaim the WAL; reopen loads segments then replays any post-seal WAL
+- Multi-segment search merge and compaction not finished yet
 
 Approximate indexes, metadata filters, and GPU acceleration are not available yet.
 

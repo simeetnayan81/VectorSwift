@@ -10,6 +10,9 @@ import VectorSwiftStorage
 /// Live points are held in an in-memory dictionary keyed by public `PointID`.
 /// When opened with a write-ahead log (path-backed database), mutations append
 /// WAL records before updating memory so acked writes can be restored on reopen.
+/// Sealed snapshots materialize the full live set into segment files under
+/// `segments/{id}/`; after seal the WAL is reclaimed and reopen loads segments
+/// then replays any post-seal WAL frames.
 ///
 /// ## Durability (S14)
 /// `DurabilityLevel` selects when the process waits for WAL data to reach stable
@@ -38,10 +41,20 @@ public actor Collection {
     private let durability: DurabilityLevel
     private let wal: WriteAheadLog?
     private let balancedPolicy: BalancedDurabilityPolicy
+    private let layout: DatabaseLayout?
+    private let mutableSegmentMaxPoints: Int
+    private let mutableSegmentMaxBytes: Int
 
     private var live: [PointID: Entry] = [:]
     /// Count of deletes that removed a live id (for `count(includeTombstones:)`).
     private var tombstoneCount: Int = 0
+    /// Next segment id to allocate (persisted in `COLL_META.json`).
+    private var nextSegmentId: UInt64
+    /// True when live has changed since the last successful seal (or open).
+    private var hasUnsealedData: Bool = false
+    /// Approximate mutable size for seal thresholds (ops / vector bytes since seal).
+    private var unsealedPointCount: Int = 0
+    private var unsealedByteCount: Int = 0
 
     // MARK: Durability state (S14)
 
@@ -57,7 +70,7 @@ public actor Collection {
         var payload: [String: PayloadValue]
     }
 
-    /// Creates an empty collection, optionally replaying a WAL.
+    /// Creates an empty collection, optionally loading sealed segments and replaying a WAL.
     ///
     /// - Parameters:
     ///   - config: Dimension, metric, index type, and related options. Dimension
@@ -68,14 +81,22 @@ public actor Collection {
     ///     mutations are appended to this log.
     ///   - balancedPolicy: Group-fsync thresholds for ``DurabilityLevel/balanced``.
     ///     Production uses the default; tests inject tighter values.
+    ///   - layout: Database root layout for segment/MANIFEST paths (path-backed).
+    ///   - mutableSegmentMaxPoints: Seal when unsealed point ops reach this count.
+    ///   - mutableSegmentMaxBytes: Seal when unsealed vector bytes reach this size.
+    ///   - nextSegmentId: Next id to allocate (from `COLL_META.json`).
     /// - Throws: Validation errors for name/dimension, unsupported index, WAL I/O,
-    ///   or corruption during replay.
+    ///   or corruption during segment load / replay.
     public init(
         config: CollectionConfig,
         compute: any VectorCompute = PortableCPUCompute(),
         durability: DurabilityLevel = .balanced,
         wal: WriteAheadLog? = nil,
-        balancedPolicy: BalancedDurabilityPolicy = .default
+        balancedPolicy: BalancedDurabilityPolicy = .default,
+        layout: DatabaseLayout? = nil,
+        mutableSegmentMaxPoints: Int = 10_000,
+        mutableSegmentMaxBytes: Int = 64 * 1024 * 1024,
+        nextSegmentId: UInt64 = 1
     ) throws {
         try VectorValidation.requireCollectionName(config.name)
         guard config.dimension >= 1 else {
@@ -88,13 +109,34 @@ public actor Collection {
                 "Unsupported index \(config.index.rawValue); only 'flat' is available"
             )
         }
+        guard mutableSegmentMaxPoints >= 1 else {
+            throw VectorSwiftError.invalidArgument("mutableSegmentMaxPoints must be >= 1")
+        }
+        guard mutableSegmentMaxBytes >= 1 else {
+            throw VectorSwiftError.invalidArgument("mutableSegmentMaxBytes must be >= 1")
+        }
         self.name = config.name
         self.collectionConfig = config
         self.compute = compute
         self.durability = durability
         self.wal = wal
         self.balancedPolicy = balancedPolicy
+        self.layout = layout
+        self.mutableSegmentMaxPoints = mutableSegmentMaxPoints
+        self.mutableSegmentMaxBytes = mutableSegmentMaxBytes
+        self.nextSegmentId = nextSegmentId
 
+        // Base: sealed segments from MANIFEST (full snapshot model).
+        if let layout {
+            try Self.loadSealedIntoLive(
+                layout: layout,
+                collectionName: config.name,
+                dimension: config.dimension,
+                live: &live
+            )
+        }
+
+        // Redo: post-seal (or pre-first-seal) WAL frames.
         if let wal {
             let records = try wal.readAllValidRecords(truncateIncompleteTail: true)
             for record in records {
@@ -105,6 +147,17 @@ public actor Collection {
                     expectedDimension: config.dimension,
                     validateDimension: true
                 )
+            }
+            // If WAL still has upsert/delete frames, treat state as unsealed until next seal.
+            if records.contains(where: {
+                switch $0 {
+                case .upsert, .delete: return true
+                default: return false
+                }
+            }) {
+                hasUnsealedData = true
+                unsealedPointCount = live.count
+                unsealedByteCount = live.values.reduce(0) { $0 + $1.vector.count * 4 }
             }
         }
     }
@@ -157,6 +210,10 @@ public actor Collection {
         for item in prepared {
             live[item.id] = Entry(vector: item.vector, payload: item.payload)
         }
+        noteUnsealedMutation(pointCount: prepared.count, vectorBytes: prepared.reduce(0) {
+            $0 + $1.vector.count * MemoryLayout<Float>.size
+        })
+        try sealIfThresholdMet()
     }
 
     /// Removes live points by id. Unknown ids are ignored.
@@ -180,6 +237,8 @@ public actor Collection {
                 tombstoneCount += 1
             }
         }
+        noteUnsealedMutation(pointCount: ids.count, vectorBytes: 0)
+        try sealIfThresholdMet()
     }
 
     /// Fetches live points by id.
@@ -276,15 +335,27 @@ public actor Collection {
 
     /// Flushes durable state when a WAL is present.
     ///
-    /// Appends a `checkpointMark` record and **fsyncs** the log for **every**
-    /// durability level (including `.relaxed`). This is a durability barrier:
-    /// prior WAL frames are forced to stable storage on success.
-    /// Segment seal is not performed yet (S15).
+    /// When there is unsealed data and a path-backed layout, materializes a sealed
+    /// segment (VECTORS/IDS/PAYLOAD + SEGMENT_META), appends a seal WAL record,
+    /// publishes MANIFEST, and reclaims the WAL. Otherwise appends a
+    /// `checkpointMark` and **fsyncs** (S14 durability barrier for every level).
     public func checkpoint() throws {
         try ensureAcceptingMutations()
         guard wal != nil else { return }
+        if hasUnsealedData, layout != nil, !live.isEmpty {
+            try sealMutable()
+            return
+        }
         // Retry path: does not short-circuit on sticky; attempts barrier fsync.
         try appendSyncedOrThrow(.checkpointMark)
+    }
+
+    /// Forces a seal of the current live set when path-backed (test / advanced use).
+    ///
+    /// No-op when there is no layout/WAL, no live points, or nothing unsealed.
+    public func seal() throws {
+        try ensureAcceptingMutations()
+        try sealMutable()
     }
 
     /// Stops mutations and optionally fsyncs the WAL.
@@ -426,6 +497,140 @@ public actor Collection {
         }
     }
 
+    // MARK: - Seal (mutable → sealed segment)
+
+    private func noteUnsealedMutation(pointCount: Int, vectorBytes: Int) {
+        hasUnsealedData = true
+        unsealedPointCount += pointCount
+        unsealedByteCount += vectorBytes
+    }
+
+    private func sealIfThresholdMet() throws {
+        guard layout != nil, wal != nil, hasUnsealedData else { return }
+        if unsealedPointCount >= mutableSegmentMaxPoints
+            || unsealedByteCount >= mutableSegmentMaxBytes
+        {
+            try sealMutable()
+        }
+    }
+
+    /// Full-snapshot seal: write all live points to one segment, replace MANIFEST,
+    /// append seal_segment_v2, reclaim WAL, drop prior segment dirs.
+    private func sealMutable() throws {
+        guard let layout, let wal else { return }
+        guard hasUnsealedData, !live.isEmpty else { return }
+
+        let segmentId = nextSegmentId
+        let rows: [SealedSegmentIO.Row] = live.map { id, entry in
+            SealedSegmentIO.Row(id: id, vector: entry.vector, payload: entry.payload)
+        }
+
+        let written = try SealedSegmentIO.writeSegment(
+            segmentId: segmentId,
+            dimension: collectionConfig.dimension,
+            index: collectionConfig.index,
+            rows: rows,
+            segmentDirectory: layout.segmentDirectory(collection: name, segmentId: segmentId),
+            vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
+            idsURL: layout.idsBin(collection: name, segmentId: segmentId),
+            payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
+        )
+
+        let sealPayload = WALSealSegmentV2Payload(
+            segmentId: written.segmentId,
+            rowCount: written.rowCount,
+            vectorsCrc32: written.vectorsCrc32,
+            idsCrc32: written.idsCrc32,
+            payloadsCrc32: written.payloadsCrc32
+        )
+        _ = try appendSyncedOrThrow(.sealSegmentV2(sealPayload))
+
+        var manifest = ManifestDocument.empty
+        if JSONFileStore.exists(layout.manifest(collection: name)) {
+            manifest = try JSONFileStore.read(
+                ManifestDocument.self,
+                from: layout.manifest(collection: name)
+            )
+        }
+        let previousIds = manifest.segmentIds
+        manifest.generation += 1
+        manifest.segmentIds = [segmentId]
+        manifest.walEpoch += 1
+        try JSONFileStore.writeAtomic(manifest, to: layout.manifest(collection: name))
+        try Self.fsyncFile(at: layout.manifest(collection: name))
+
+        // Reclaim pre-seal frames; live remains the source of truth in memory.
+        try wal.resetEmpty()
+        markDurableSuccess()
+
+        nextSegmentId = segmentId + 1
+        try persistCollectionMeta(layout: layout)
+
+        // Best-effort remove superseded segment directories.
+        for oldId in previousIds where oldId != segmentId {
+            let dir = layout.segmentDirectory(collection: name, segmentId: oldId)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        hasUnsealedData = false
+        unsealedPointCount = 0
+        unsealedByteCount = 0
+    }
+
+    private func persistCollectionMeta(layout: DatabaseLayout) throws {
+        let meta = CollectionMetaDocument(
+            config: collectionConfig,
+            nextSegmentId: nextSegmentId,
+            nextRowId: 1
+        )
+        try JSONFileStore.writeAtomic(meta, to: layout.collectionMeta(name: name))
+    }
+
+    private static func fsyncFile(at url: URL) throws {
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.synchronize()
+        } catch let error as VectorSwiftError {
+            throw error
+        } catch {
+            throw VectorSwiftError.io("Failed to fsync \(url.path): \(error)")
+        }
+    }
+
+    private static func loadSealedIntoLive(
+        layout: DatabaseLayout,
+        collectionName: String,
+        dimension: Int,
+        live: inout [PointID: Entry]
+    ) throws {
+        let manifestURL = layout.manifest(collection: collectionName)
+        guard JSONFileStore.exists(manifestURL) else { return }
+
+        let manifest = try JSONFileStore.read(ManifestDocument.self, from: manifestURL)
+        if manifest.formatVersion != StorageFormat.version {
+            throw VectorSwiftError.corrupted(
+                path: manifestURL.path,
+                reason: "Unsupported MANIFEST formatVersion \(manifest.formatVersion)"
+            )
+        }
+
+        for segmentId in manifest.segmentIds {
+            let rows = try SealedSegmentIO.loadSegment(
+                segmentId: segmentId,
+                expectedDimension: dimension,
+                vectorsURL: layout.vectorsBin(collection: collectionName, segmentId: segmentId),
+                idsURL: layout.idsBin(collection: collectionName, segmentId: segmentId),
+                payloadURL: layout.payloadBin(collection: collectionName, segmentId: segmentId),
+                metaURL: layout.segmentMeta(collection: collectionName, segmentId: segmentId)
+            )
+            for row in rows {
+                live[row.id] = Entry(vector: row.vector, payload: row.payload)
+            }
+        }
+    }
+
     // MARK: - Internals
 
     /// Applies a single WAL record to in-memory state (no further WAL writes).
@@ -450,9 +655,9 @@ public actor Collection {
             }
         case .checkpointMark:
             break
-        case .sealSegment:
-            // Seal is applied when segment files exist (S15). Record is accepted
-            // on replay so future logs remain readable, but has no memory effect yet.
+        case .sealSegment, .sealSegmentV2:
+            // Segment rows are loaded from MANIFEST files before WAL replay.
+            // Seal records are accepted so logs remain readable.
             break
         }
     }

@@ -81,7 +81,11 @@ public actor Database {
             let loaded = try loadCollections(
                 layout: layout,
                 compute: diskCompute,
-                durability: resolvedConfig.durability
+                durability: resolvedConfig.durability,
+                sealThresholds: (
+                    resolvedConfig.mutableSegmentMaxPoints,
+                    resolvedConfig.mutableSegmentMaxBytes
+                )
             )
             return Database(
                 layout: layout,
@@ -212,7 +216,11 @@ public actor Database {
             config: config,
             compute: compute,
             durability: databaseConfig.durability,
-            wal: wal
+            wal: wal,
+            layout: layout,
+            mutableSegmentMaxPoints: databaseConfig.mutableSegmentMaxPoints,
+            mutableSegmentMaxBytes: databaseConfig.mutableSegmentMaxBytes,
+            nextSegmentId: 1
         )
     }
 
@@ -239,7 +247,8 @@ public actor Database {
     private static func loadCollections(
         layout: DatabaseLayout,
         compute: any VectorCompute,
-        durability: DurabilityLevel
+        durability: DurabilityLevel,
+        sealThresholds: (points: Int, bytes: Int)
     ) throws -> [String: Collection] {
         guard JSONFileStore.exists(layout.catalog) else {
             throw VectorSwiftError.corrupted(
@@ -272,7 +281,11 @@ public actor Database {
                 config: meta.config,
                 compute: compute,
                 durability: durability,
-                wal: wal
+                wal: wal,
+                layout: layout,
+                mutableSegmentMaxPoints: sealThresholds.points,
+                mutableSegmentMaxBytes: sealThresholds.bytes,
+                nextSegmentId: meta.nextSegmentId
             )
             result[name] = collection
         }
