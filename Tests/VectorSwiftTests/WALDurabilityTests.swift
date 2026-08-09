@@ -260,4 +260,108 @@ final class WALDurabilityTests: XCTestCase {
         XCTAssertEqual(got[19].vector, [19, 20])
         try await reopened.close()
     }
+
+    // MARK: - S14 close / checkpoint barriers
+
+    func testRelaxedSurvivesReopenAfterClose() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let db = try await Database.open(
+            path: root,
+            config: DatabaseConfig(durability: .relaxed, compute: .cpu)
+        )
+        try await db.createCollection(CollectionConfig(name: "docs", dimension: 2, metric: .l2))
+        try await db.collection(name: "docs").upsert([
+            Point(id: "a", vector: [1, 0]),
+            Point(id: "b", vector: [0, 1]),
+        ])
+        // No explicit checkpoint — close must fsync (S14).
+        try await db.close()
+
+        let reopened = try await Database.open(path: root)
+        let col = try await reopened.collection(name: "docs")
+        let _count = await col.count()
+        XCTAssertEqual(_count, 2)
+        let got = await col.get(ids: ["a", "b"], withVector: true)
+        XCTAssertEqual(got[0].vector, [1, 0])
+        XCTAssertEqual(got[1].vector, [0, 1])
+        try await reopened.close()
+    }
+
+    func testCheckpointBarrierSurvivesWithoutCloseFsyncPath() async throws {
+        // checkpoint under balanced must fsync; data recoverable even if we only
+        // rely on checkpoint (then kill via process exit simulation = close without
+        // needing another mutation).
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let db = try await Database.open(
+            path: root,
+            config: DatabaseConfig(durability: .balanced, compute: .cpu)
+        )
+        try await db.createCollection(CollectionConfig(name: "docs", dimension: 2, metric: .l2))
+        try await db.collection(name: "docs").upsert([Point(id: "cp", vector: [3, 4])])
+        try await db.checkpoint()
+        try await db.close()
+
+        let reopened = try await Database.open(path: root)
+        let col = try await reopened.collection(name: "docs")
+        let got = await col.get(ids: ["cp"], withVector: true)
+        XCTAssertEqual(got[0].vector, [3, 4])
+        try await reopened.close()
+    }
+
+    func testRelaxedCheckpointMarkAndDataSurvive() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let db = try await Database.open(
+            path: root,
+            config: DatabaseConfig(durability: .relaxed, compute: .cpu)
+        )
+        try await db.createCollection(CollectionConfig(name: "docs", dimension: 2, metric: .l2))
+        try await db.collection(name: "docs").upsert([Point(id: "a", vector: [1, 2])])
+        try await db.checkpoint()
+        try await db.close()
+
+        let wal = WriteAheadLog(url: DatabaseLayout(root: root).walLog(collection: "docs"))
+        let records = try wal.readAllValidRecords()
+        XCTAssertTrue(records.contains(.checkpointMark))
+        XCTAssertTrue(records.contains {
+            if case .upsert(let id, _, _) = $0 { return id == "a" }
+            return false
+        })
+
+        let reopened = try await Database.open(path: root)
+        let col = try await reopened.collection(name: "docs")
+        let countLive = await col.count()
+        XCTAssertEqual(countLive, 1)
+        try await reopened.close()
+    }
+
+    func testManyBalancedWritesSurviveClose() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let n = 100
+        let db = try await Database.open(
+            path: root,
+            config: DatabaseConfig(durability: .balanced, compute: .cpu)
+        )
+        try await db.createCollection(CollectionConfig(name: "docs", dimension: 2, metric: .l2))
+        let col = try await db.collection(name: "docs")
+        for i in 0..<n {
+            try await col.upsert([
+                Point(id: "id-\(i)", vector: [Float(i), Float(i + 1)])
+            ])
+        }
+        try await db.close()
+
+        let reopened = try await Database.open(path: root)
+        let again = try await reopened.collection(name: "docs")
+        let countLive = await again.count()
+        XCTAssertEqual(countLive, n)
+        try await reopened.close()
+    }
 }

@@ -42,14 +42,76 @@ public struct HNSWParams: Sendable, Codable, Equatable {
     }
 }
 
-/// How aggressively writes are forced to stable storage once durability exists.
+/// How aggressively writes are forced to stable storage once a path-backed WAL exists.
+///
+/// Ephemeral (no-path) databases have no WAL; this enum does not apply there.
+/// Platform note: durability after fsync follows `FileHandle.synchronize()` /
+/// OS semantics. On some Apple volumes that may be weaker than `F_FULLFSYNC`
+/// for power loss; VectorSwift does not call `F_FULLFSYNC` today.
 public enum DurabilityLevel: String, Sendable, Codable, Equatable, CaseIterable {
-    /// Memory-first; best-effort flush. May lose recent acks on crash.
+    /// Fastest path-backed mode. WAL frames are written to the kernel before
+    /// upsert/delete returns, but VectorSwift does not fsync on the hot path.
+    ///
+    /// Loss window: any prefix of the WAL that has not reached stable storage
+    /// may disappear on OS crash, power loss, or abrupt device sleep. Process
+    /// crashes often still recover if the kernel page cache survives.
+    /// `checkpoint()` and successful `Database.close()` fsync the WAL (clean
+    /// handoff) but do not make the whole relaxed session power-fail safe.
+    ///
+    /// Never use for data you cannot re-ingest after power failure.
     case relaxed
-    /// WAL append on write; group fsync on interval, size, or checkpoint.
+
+    /// Default (D12). WAL frames are written before ack. fsync runs when
+    /// pending records ≥ 64, pending bytes ≥ 256 KiB, at most ~100 ms after
+    /// the first unsynced write in a dirty window, or on checkpoint/close —
+    /// whichever comes first.
+    ///
+    /// Loss window: acks since the last successful fsync (bounded by those
+    /// thresholds) may be lost on power failure. Process crash after `write()`
+    /// typically recovers. `checkpoint()` and `close()` close the window.
     case balanced
-    /// fsync WAL before upsert/delete returns.
+
+    /// Strongest. Each upsert/delete batch fsyncs the WAL before memory apply
+    /// and before the call returns. Survives process crash and, subject to
+    /// platform fsync semantics, power loss for that batch.
     case strict
+}
+
+/// Group-fsync thresholds for ``DurabilityLevel/balanced``.
+///
+/// Production collections use ``default``. Tests inject a tighter policy per
+/// `Collection` instance (no process-global overrides).
+public struct BalancedDurabilityPolicy: Sendable, Equatable {
+    /// fsync after this many WAL records have been appended without sync.
+    public var syncEveryRecords: Int
+    /// fsync after this many on-disk frame bytes have been appended without sync.
+    public var syncEveryBytes: Int
+    /// Coalesced dirty-window deadline: at most this many nanoseconds after the
+    /// first unsynced write in a dirty window before a background fsync runs.
+    public var syncIntervalNanoseconds: UInt64
+
+    public init(
+        syncEveryRecords: Int,
+        syncEveryBytes: Int,
+        syncIntervalNanoseconds: UInt64
+    ) {
+        self.syncEveryRecords = syncEveryRecords
+        self.syncEveryBytes = syncEveryBytes
+        self.syncIntervalNanoseconds = syncIntervalNanoseconds
+    }
+
+    public static let `default` = BalancedDurabilityPolicy(
+        syncEveryRecords: 64,
+        syncEveryBytes: 256 * 1024,
+        syncIntervalNanoseconds: 100_000_000
+    )
+}
+
+/// Named mirrors of ``BalancedDurabilityPolicy/default`` for docs and tests.
+public enum BalancedDurabilityDefaults {
+    public static let syncEveryRecords = BalancedDurabilityPolicy.default.syncEveryRecords
+    public static let syncEveryBytes = BalancedDurabilityPolicy.default.syncEveryBytes
+    public static let syncIntervalNanoseconds = BalancedDurabilityPolicy.default.syncIntervalNanoseconds
 }
 
 /// Preferred distance backend for a database instance.
