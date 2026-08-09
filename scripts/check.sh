@@ -1,39 +1,17 @@
 #!/usr/bin/env bash
-# Pre-merge / CI gate for VectorSwift.
-# Runs the same checks expected to pass before merging to main.
+# Local convenience: run the three *separate* checks in order.
+# CI runs the same scripts as independent jobs (build / test / example × OS).
+#
+#   1. Library build (debug + release)  — ./scripts/build.sh --release
+#   2. Unit tests                       — ./scripts/test.sh   (mandatory before commit)
+#   3. Example executable               — ./scripts/example.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Prefer full Xcode on macOS (Command Line Tools alone lack XCTest).
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  if [[ -d /Applications/Xcode.app/Contents/Developer ]]; then
-    export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-  fi
-  if ! xcrun --find xctest >/dev/null 2>&1; then
-    echo "error: XCTest not found. Install Xcode and run:" >&2
-    echo "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
-    exit 1
-  fi
-fi
-
-echo "==> swift --version"
-swift --version
-
-echo "==> Resolve package"
-swift package resolve
-
-echo "==> Build (debug)"
-swift build
-
-echo "==> Build (release)"
-swift build -c release
-
-echo "==> Test"
-swift test
-
-echo "==> Example binary builds"
-swift build --product VectorSwiftExample
+"${SCRIPT_DIR}/build.sh" --release
+"${SCRIPT_DIR}/test.sh"
+"${SCRIPT_DIR}/example.sh"
 
 echo "==> All checks passed"

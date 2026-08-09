@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Run the unit/integration test suite only.
+# Unit / integration tests only (VectorSwiftTests).
+# Does not build VectorSwiftExample. Mandatory before every commit.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+vs_cd_root
+vs_require_xctest
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  if [[ -d /Applications/Xcode.app/Contents/Developer ]]; then
-    export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-  fi
-fi
+echo "==> swift --version"
+swift --version
 
-exec swift test "$@"
+echo "==> Test (VectorSwiftTests; example product is not built)"
+swift test "$@"
+
+echo "==> Unit tests passed"

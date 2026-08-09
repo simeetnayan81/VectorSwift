@@ -13,65 +13,186 @@ concurrency:
 permissions:
   contents: read
 
+# Independent jobs so a red example or one OS does not hide the others.
+# Require the aggregator job named "CI" in branch protection (see README).
+#   build-*         library target only (not VectorSwiftExample)
+#   test-linux      CPU / no Apple frameworks
+#   test-macos-mlx  Apple lane (CPU today; ComputeMLX when that target exists)
+#   example-*       sample executable only
 jobs:
-  # Primary gate: full Xcode + XCTest on macOS (matches local development).
-  macos:
-    name: macOS (build + test)
+  build-macos:
+    name: Build (macOS)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
       - name: Show toolchain
         run: |
           xcodebuild -version
           swift --version
-
       - name: Cache SwiftPM
         uses: actions/cache@v4
         with:
           path: .build
-          key: spm-macos-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-build-macos-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: |
-            spm-macos-${{ runner.os }}-
+            spm-build-macos-
+      - name: Build library (debug + release)
+        run: ./scripts/build.sh --release
 
-      - name: Pre-merge checks
-        run: ./scripts/check.sh
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libz-dev pkg-config
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+      - name: Show toolchain
+        run: swift --version
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-build-linux-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-build-linux-
+      - name: Build library (debug + release)
+        run: ./scripts/build.sh --release
 
-  # Secondary gate: Linux CPU path (no Apple frameworks). Requires libz for CRC32.
-  linux:
-    name: Linux (build + test)
+  test-linux:
+    name: Test (Linux CPU)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          # zlib headers + pkg-config metadata for SwiftPM systemLibrary(CZlib)
           sudo apt-get install -y --no-install-recommends libz-dev pkg-config
-
       - name: Install Swift
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: "5.10"
-
       - name: Show toolchain
         run: swift --version
-
       - name: Cache SwiftPM
         uses: actions/cache@v4
         with:
           path: .build
-          key: spm-linux-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-test-linux-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: |
-            spm-linux-${{ runner.os }}-
+            spm-test-linux-
+      - name: Unit tests
+        run: ./scripts/test.sh
 
-      - name: Pre-merge checks
-        run: ./scripts/check.sh
+  test-macos-mlx:
+    name: Test (macOS / MLX)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-test-macos-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-test-macos-
+      - name: Build MLX target if present
+        run: |
+          # Phase 4 will add VectorSwiftComputeMLX. Until then this is the Apple
+          # test lane (CPU PortableCPUCompute on the macOS runner).
+          if grep -q 'name: "VectorSwiftComputeMLX"' Package.swift; then
+            swift build --target VectorSwiftComputeMLX
+          else
+            echo "VectorSwiftComputeMLX not in package yet; running CPU tests on macOS."
+          fi
+      - name: Unit tests
+        run: ./scripts/test.sh
+
+  example-macos:
+    name: Example (macOS)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-example-macos-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-example-macos-
+      - name: Build VectorSwiftExample
+        run: ./scripts/example.sh
+
+  example-linux:
+    name: Example (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libz-dev pkg-config
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-example-linux-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-example-linux-
+      - name: Build VectorSwiftExample
+        run: ./scripts/example.sh
+
+  # Single required check for branch protection / rulesets.
+  ci:
+    name: CI
+    if: always()
+    needs:
+      - build-macos
+      - build-linux
+      - test-linux
+      - test-macos-mlx
+      - example-macos
+      - example-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs succeeded
+        run: |
+          set -euo pipefail
+          test "${{ needs.build-macos.result }}" = success
+          test "${{ needs.build-linux.result }}" = success
+          test "${{ needs.test-linux.result }}" = success
+          test "${{ needs.test-macos-mlx.result }}" = success
+          test "${{ needs.example-macos.result }}" = success
+          test "${{ needs.example-linux.result }}" = success
+          echo "All CI jobs succeeded."
