@@ -36,30 +36,48 @@ sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
 ## Build & test
 
-Preferred (same checks as CI before merge):
+Checks are **separate**. Do not use a bare `swift build` (that also builds the example).
+
+| Script | What |
+| --- | --- |
+| `./scripts/test.sh` | **Unit tests only** (`VectorSwiftTests`). **Required before every commit.** |
+| `./scripts/build.sh` | Library target `VectorSwift` only (debug). `--release` adds a release build. Does **not** build the example. |
+| `./scripts/example.sh` | Sample executable `VectorSwiftExample` only. |
+| `./scripts/check.sh` | Local convenience: build `--release`, then tests, then example (same three scripts, in order). |
 
 ```bash
-./scripts/check.sh
-```
-
-Or individually:
-
-```bash
-./scripts/test.sh          # swift test
-swift build
-swift test
+./scripts/test.sh              # mandatory before commit
+./scripts/build.sh --release   # library only
+./scripts/example.sh           # optional local / CI example job
 ```
 
 ### Continuous integration
 
-Pull requests and pushes to `main` run [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+Pull requests and pushes to `main` run [`.github/workflows/ci.yml`](.github/workflows/ci.yml) as **independent** jobs:
 
-| Job | Runner | What runs |
+| Job | Runner | Script |
 | --- | --- | --- |
-| macOS | `macos-15` + Xcode | `./scripts/check.sh` (debug/release build + tests + example) |
-| Linux | `ubuntu-latest` + Swift 5.10 | Same script (CPU path; links system `libz`) |
+| Build (macOS) | `macos-15` + Xcode | `./scripts/build.sh --release` |
+| Build (Linux) | `ubuntu-latest` + Swift 5.10 | `./scripts/build.sh --release` (system `libz`) |
+| Test (Linux CPU) | `ubuntu-latest` + Swift 5.10 | `./scripts/test.sh` |
+| Test (macOS / MLX) | `macos-15` + Xcode | `./scripts/test.sh` (+ MLX target when `VectorSwiftComputeMLX` exists) |
+| Example (macOS / Linux) | same runners | `./scripts/example.sh` |
+| **macOS (build + test)** | aggregator | Green if all macOS jobs succeeded |
+| **Linux (build + test)** | aggregator | Green if all Linux jobs succeeded |
+| **CI** | aggregator | Green if both OS aggregators succeeded |
 
-Merge only when both jobs are green.
+Merge when required checks are green. Existing branch protection still uses **macOS (build + test)** and **Linux (build + test)**; those names are posted by the aggregators. You can later require only **CI**.
+
+Unit tests are a commit gate locally, not only a merge gate.
+
+#### GitHub: required checks for `main`
+
+**Settings → Branches** (or **Rules → Rulesets**), require a PR, then require status checks:
+
+- Keep (current): `macOS (build + test)` and `Linux (build + test)` — these now report again.
+- Optional later: add `CI` and drop the two OS names so you only maintain one required check.
+
+Check names appear in the picker after this workflow has run once.
 
 ## Example
 

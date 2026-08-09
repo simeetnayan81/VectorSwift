@@ -1,5 +1,6 @@
 # Local notes / planning (never publish)
 .local/
+AGENTS.md
 
 # SwiftPM / Xcode
 .build/
