@@ -14,10 +14,11 @@ in applications and Swift services.
   catalog metadata (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
   plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes survive reopen
 - **Durability levels** (`relaxed` / `balanced` default / `strict`): control when the WAL is fsynced; `checkpoint()` and clean `close()` fsync for all levels
-- **Seal**: `checkpoint()` / size thresholds flush live points to sealed segment files
-  (`VECTORS.bin` / `IDS.bin` / `PAYLOAD.bin` + `SEGMENT_META.json`), publish `MANIFEST.json`,
-  and reclaim the WAL; reopen loads segments then replays any post-seal WAL
-- Multi-segment search merge and compaction not finished yet
+- **Seal**: `checkpoint()` / size thresholds flush the mutable overlay to a new
+  sealed segment (`VECTORS.bin` / `IDS.bin` / `PAYLOAD.bin` / `TOMBSTONES.bin` +
+  `SEGMENT_META.json`), atomically append it to `MANIFEST.json`, and reclaim the WAL
+- **Search** merges exact top-k across sealed segments + the mutable overlay
+  (last write wins; tombstones hide deleted sealed ids). Compaction is not finished yet
 
 Approximate indexes, metadata filters, and GPU acceleration are not available yet.
 

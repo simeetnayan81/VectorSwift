@@ -79,6 +79,7 @@ let package = Package(
                 "VectorSwift",
                 "VectorSwiftCompute",
                 "VectorSwiftIndex",
+                "VectorSwiftQuery",
                 "VectorSwiftStorage",
             ],
             path: "Tests/VectorSwiftTests"

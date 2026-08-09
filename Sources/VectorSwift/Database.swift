@@ -15,7 +15,8 @@ import VectorSwiftStorage
 /// - **No path** (`open()`): purely in-memory. Closing drops the catalog; nothing on disk.
 /// - **With path** (`open(path:)`): writes and reloads catalog metadata under that directory
 ///   (`DB_META.json`, `CATALOG.json`, `collections/*/COLL_META.json`). Collection **points**
-///   are recorded in per-collection `wal/wal.log` and restored on reopen (S13).
+///   are recorded in per-collection `wal/wal.log` and sealed into `segments/`
+///   (MANIFEST + WAL replay on reopen).
 ///
 /// ## Concurrency
 /// `Database` is an actor. Catalog mutations are serialized here; point-level

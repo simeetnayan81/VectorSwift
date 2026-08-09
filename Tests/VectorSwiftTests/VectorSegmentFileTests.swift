@@ -478,6 +478,9 @@ final class VectorSegmentFileTests: XCTestCase {
         )
         XCTAssertTrue(layout.vectorsBin(collection: "docs", segmentId: 42).path.hasSuffix("VECTORS.bin"))
         XCTAssertTrue(layout.idsBin(collection: "docs", segmentId: 42).path.hasSuffix("IDS.bin"))
+        XCTAssertTrue(
+            layout.tombstonesBin(collection: "docs", segmentId: 42).path.hasSuffix("TOMBSTONES.bin")
+        )
         XCTAssertNotEqual(
             layout.vectorsBin(collection: "a", segmentId: 1).path,
             layout.vectorsBin(collection: "b", segmentId: 1).path

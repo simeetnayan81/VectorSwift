@@ -172,12 +172,20 @@ final class SealTests: XCTestCase {
         )
         let walSize = try Data(contentsOf: DatabaseLayout(root: root).walLog(collection: "docs")).count
         XCTAssertEqual(walSize, 0)
+        try await col.upsert([point("4", x: 4)])
+        try await col.upsert([point("5", x: 5)])
+        try await col.upsert([point("6", x: 6)])
+        let manifest = try JSONFileStore.read(
+            ManifestDocument.self,
+            from: DatabaseLayout(root: root).manifest(collection: "docs")
+        )
+        XCTAssertGreaterThanOrEqual(manifest.segmentIds.count, 2)
         try await db.close()
 
         let reopened = try await Database.open(path: root)
         let reopenedCol = try await reopened.collection(name: "docs")
         let count = await reopenedCol.count()
-        XCTAssertEqual(count, 3)
+        XCTAssertEqual(count, 6)
         try await reopened.close()
     }
 
@@ -227,10 +235,24 @@ final class SealTests: XCTestCase {
         try await reopened.checkpoint()
         try await reopened.close()
 
-        // After second seal, WAL empty again; both points in latest segment.
+        // After second seal, WAL empty again; both points live across two segments.
         XCTAssertEqual(
             try Data(contentsOf: DatabaseLayout(root: root).walLog(collection: "docs")).count,
             0
+        )
+        let layout = DatabaseLayout(root: root)
+        let manifest = try JSONFileStore.read(
+            ManifestDocument.self,
+            from: layout.manifest(collection: "docs")
+        )
+        XCTAssertEqual(manifest.segmentIds.count, 2)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: layout.segmentDirectory(
+                    collection: "docs",
+                    segmentId: manifest.segmentIds[0]
+                ).path
+            )
         )
         let again = try await Database.open(path: root)
         let againCol = try await again.collection(name: "docs")
@@ -312,10 +334,12 @@ final class SealTests: XCTestCase {
             dimension: 2,
             index: .flat,
             rows: rows,
+            tombstones: ["gone"],
             segmentDirectory: layout.segmentDirectory(collection: name, segmentId: segmentId),
             vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
             idsURL: layout.idsBin(collection: name, segmentId: segmentId),
             payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            tombstonesURL: layout.tombstonesBin(collection: name, segmentId: segmentId),
             metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
         )
         let loaded = try SealedSegmentIO.loadSegment(
@@ -324,11 +348,58 @@ final class SealTests: XCTestCase {
             vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
             idsURL: layout.idsBin(collection: name, segmentId: segmentId),
             payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            tombstonesURL: layout.tombstonesBin(collection: name, segmentId: segmentId),
             metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
         )
-        XCTAssertEqual(loaded.count, 2)
-        XCTAssertEqual(loaded[0].id, "a")
-        XCTAssertEqual(loaded[0].vector, [1, 2])
-        XCTAssertEqual(loaded[1].vector, [3, 4])
+        XCTAssertEqual(loaded.rows.count, 2)
+        XCTAssertEqual(loaded.rows[0].id, "a")
+        XCTAssertEqual(loaded.rows[0].vector, [1, 2])
+        XCTAssertEqual(loaded.rows[1].vector, [3, 4])
+        XCTAssertEqual(loaded.tombstones, ["gone"])
+    }
+
+    func testLoadSegmentWithoutTombstonesFileIsEmpty() throws {
+        let dir = try tempRoot("seg-legacy")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let layout = DatabaseLayout(root: dir)
+        let name = "docs"
+        let segmentId: UInt64 = 1
+        _ = try SealedSegmentIO.writeSegment(
+            segmentId: segmentId,
+            dimension: 2,
+            index: .flat,
+            rows: [SealedSegmentIO.Row(id: "a", vector: [1, 0], payload: [:])],
+            tombstones: [],
+            segmentDirectory: layout.segmentDirectory(collection: name, segmentId: segmentId),
+            vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
+            idsURL: layout.idsBin(collection: name, segmentId: segmentId),
+            payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            tombstonesURL: layout.tombstonesBin(collection: name, segmentId: segmentId),
+            metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
+        )
+        // Simulate an S15 segment: drop TOMBSTONES.bin and clear the CRC field.
+        try FileManager.default.removeItem(
+            at: layout.tombstonesBin(collection: name, segmentId: segmentId)
+        )
+        var meta = try JSONFileStore.read(
+            SegmentMetaDocument.self,
+            from: layout.segmentMeta(collection: name, segmentId: segmentId)
+        )
+        meta.tombstonesCrc32 = 0
+        try JSONFileStore.writeAtomic(
+            meta,
+            to: layout.segmentMeta(collection: name, segmentId: segmentId)
+        )
+        let loaded = try SealedSegmentIO.loadSegment(
+            segmentId: segmentId,
+            expectedDimension: 2,
+            vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
+            idsURL: layout.idsBin(collection: name, segmentId: segmentId),
+            payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            tombstonesURL: layout.tombstonesBin(collection: name, segmentId: segmentId),
+            metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
+        )
+        XCTAssertEqual(loaded.rows.count, 1)
+        XCTAssertEqual(loaded.tombstones, [])
     }
 }

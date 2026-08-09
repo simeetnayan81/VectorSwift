@@ -56,12 +56,13 @@ public struct CollectionMetaDocument: Codable, Equatable, Sendable {
 
 /// Live sealed segment list for a collection (`MANIFEST.json`).
 ///
-/// Published via write-temp + rename. Readers trust only the final file.
+/// Published via write-tmp + fsync + rename-over (see `JSONFileStore.writeAtomic`).
+/// Readers trust only the final file. Segment ids are in seal order (oldest first).
 public struct ManifestDocument: Codable, Equatable, Sendable {
     public var formatVersion: Int
     /// Monotonic generation; incremented on every successful seal publish.
     public var generation: UInt64
-    /// Active sealed segment ids in seal order (v1: typically a single full snapshot).
+    /// Active sealed segment ids in seal order (oldest first; later ids win on conflict).
     public var segmentIds: [UInt64]
     /// WAL epoch (bumped when the log is reclaimed after seal).
     public var walEpoch: UInt64
@@ -84,7 +85,7 @@ public struct ManifestDocument: Codable, Equatable, Sendable {
 /// Per-sealed-segment metadata (`SEGMENT_META.json`).
 ///
 /// Written last in the segment directory so incomplete seals are detectable.
-public struct SegmentMetaDocument: Codable, Equatable, Sendable {
+public struct SegmentMetaDocument: Equatable, Sendable {
     public var formatVersion: Int
     public var segmentId: UInt64
     public var dimension: Int
@@ -93,6 +94,8 @@ public struct SegmentMetaDocument: Codable, Equatable, Sendable {
     public var vectorsCrc32: UInt32
     public var idsCrc32: UInt32
     public var payloadsCrc32: UInt32
+    /// CRC of `TOMBSTONES.bin` trailer. `0` means “file missing is OK” (S15 segments).
+    public var tombstonesCrc32: UInt32
 
     public init(
         formatVersion: Int = StorageFormat.version,
@@ -102,7 +105,8 @@ public struct SegmentMetaDocument: Codable, Equatable, Sendable {
         index: IndexConfig = .flat,
         vectorsCrc32: UInt32,
         idsCrc32: UInt32,
-        payloadsCrc32: UInt32
+        payloadsCrc32: UInt32,
+        tombstonesCrc32: UInt32 = 0
     ) {
         self.formatVersion = formatVersion
         self.segmentId = segmentId
@@ -112,5 +116,46 @@ public struct SegmentMetaDocument: Codable, Equatable, Sendable {
         self.vectorsCrc32 = vectorsCrc32
         self.idsCrc32 = idsCrc32
         self.payloadsCrc32 = payloadsCrc32
+        self.tombstonesCrc32 = tombstonesCrc32
+    }
+}
+
+extension SegmentMetaDocument: Codable {
+    enum CodingKeys: String, CodingKey {
+        case formatVersion
+        case segmentId
+        case dimension
+        case rowCount
+        case index
+        case vectorsCrc32
+        case idsCrc32
+        case payloadsCrc32
+        case tombstonesCrc32
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try c.decode(Int.self, forKey: .formatVersion)
+        segmentId = try c.decode(UInt64.self, forKey: .segmentId)
+        dimension = try c.decode(Int.self, forKey: .dimension)
+        rowCount = try c.decode(UInt64.self, forKey: .rowCount)
+        index = try c.decode(IndexConfig.self, forKey: .index)
+        vectorsCrc32 = try c.decode(UInt32.self, forKey: .vectorsCrc32)
+        idsCrc32 = try c.decode(UInt32.self, forKey: .idsCrc32)
+        payloadsCrc32 = try c.decode(UInt32.self, forKey: .payloadsCrc32)
+        tombstonesCrc32 = try c.decodeIfPresent(UInt32.self, forKey: .tombstonesCrc32) ?? 0
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(formatVersion, forKey: .formatVersion)
+        try c.encode(segmentId, forKey: .segmentId)
+        try c.encode(dimension, forKey: .dimension)
+        try c.encode(rowCount, forKey: .rowCount)
+        try c.encode(index, forKey: .index)
+        try c.encode(vectorsCrc32, forKey: .vectorsCrc32)
+        try c.encode(idsCrc32, forKey: .idsCrc32)
+        try c.encode(payloadsCrc32, forKey: .payloadsCrc32)
+        try c.encode(tombstonesCrc32, forKey: .tombstonesCrc32)
     }
 }

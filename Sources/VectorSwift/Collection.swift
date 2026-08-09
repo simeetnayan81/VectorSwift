@@ -2,17 +2,20 @@ import Foundation
 import VectorSwiftCore
 import VectorSwiftCompute
 import VectorSwiftIndex
+import VectorSwiftQuery
 import VectorSwiftStorage
 
 /// Named set of points with fixed dimensionality and distance metric.
 ///
 /// ## Storage model
-/// Live points are held in an in-memory dictionary keyed by public `PointID`.
-/// When opened with a write-ahead log (path-backed database), mutations append
-/// WAL records before updating memory so acked writes can be restored on reopen.
-/// Sealed snapshots materialize the full live set into segment files under
-/// `segments/{id}/`; after seal the WAL is reclaimed and reopen loads segments
-/// then replays any post-seal WAL frames.
+/// Path-backed collections keep immutable **sealed segments** plus a **mutable**
+/// overlay. Upserts/deletes append WAL frames, then update the overlay. Seal
+/// (threshold or `checkpoint`) writes only the overlay (+ epoch tombstones) as a
+/// new segment, **appends** it to `MANIFEST.json`, and reclaims the WAL.
+/// Reopen loads MANIFEST segments in order (later ids win), applies per-segment
+/// tombstones, then replays any post-seal WAL.
+///
+/// Ephemeral collections (no path) keep everything in the mutable map.
 ///
 /// ## Durability (S14)
 /// `DurabilityLevel` selects when the process waits for WAL data to reach stable
@@ -24,9 +27,9 @@ import VectorSwiftStorage
 /// actor, so callers can safely share one collection across tasks.
 ///
 /// ## Search path
-/// `search` snapshots live points into a row-major float matrix, runs exact
-/// `FlatIndex` search via the injected `VectorCompute` backend, then maps row
-/// indices back to public IDs and optional payload/vector fields.
+/// Exact `FlatIndex` search per sealed segment (skipping superseded/tombstoned
+/// rows via `idIndex`) plus the mutable overlay, then
+/// ``MultiSegmentMerge/topK(_:k:)``.
 ///
 /// ## Normalization
 /// When `config.normalizeVectors` is true, vectors are L2-normalized on upsert
@@ -45,7 +48,12 @@ public actor Collection {
     private let mutableSegmentMaxPoints: Int
     private let mutableSegmentMaxBytes: Int
 
-    private var live: [PointID: Entry] = [:]
+    private var sealed: [SealedSegment] = []
+    private var mutable: [PointID: Entry] = [:]
+    /// Last-write-wins location of every live public id.
+    private var idIndex: [PointID: Location] = [:]
+    /// Deletes of ids that still have a row in some sealed segment (this epoch).
+    private var epochTombstones: Set<PointID> = []
     /// Count of deletes that removed a live id (for `count(includeTombstones:)`).
     private var tombstoneCount: Int = 0
     /// Next segment id to allocate (persisted in `COLL_META.json`).
@@ -68,6 +76,26 @@ public actor Collection {
     private struct Entry: Sendable {
         var vector: [Float]
         var payload: [String: PayloadValue]
+    }
+
+    private enum Location: Sendable, Equatable {
+        case sealed(segmentId: UInt64, row: UInt32)
+        case mutable
+    }
+
+    private struct SealedSegment: Sendable {
+        var id: UInt64
+        var ids: [PointID]
+        var vectors: [Float]
+        var payloads: [[String: PayloadValue]]
+        var tombstones: [PointID]
+
+        var rowCount: Int { ids.count }
+
+        func vector(at row: Int, dim: Int) -> [Float] {
+            let start = row * dim
+            return Array(vectors[start..<(start + dim)])
+        }
     }
 
     /// Creates an empty collection, optionally loading sealed segments and replaying a WAL.
@@ -126,29 +154,30 @@ public actor Collection {
         self.mutableSegmentMaxBytes = mutableSegmentMaxBytes
         self.nextSegmentId = nextSegmentId
 
-        // Base: sealed segments from MANIFEST (full snapshot model).
         if let layout {
-            try Self.loadSealedIntoLive(
+            try Self.loadSealed(
                 layout: layout,
                 collectionName: config.name,
                 dimension: config.dimension,
-                live: &live
+                sealed: &sealed,
+                idIndex: &idIndex
             )
         }
 
-        // Redo: post-seal (or pre-first-seal) WAL frames.
         if let wal {
             let records = try wal.readAllValidRecords(truncateIncompleteTail: true)
             for record in records {
                 try Self.applyRecord(
                     record,
-                    into: &live,
+                    sealed: sealed,
+                    mutable: &mutable,
+                    idIndex: &idIndex,
+                    epochTombstones: &epochTombstones,
                     tombstoneCount: &tombstoneCount,
                     expectedDimension: config.dimension,
                     validateDimension: true
                 )
             }
-            // If WAL still has upsert/delete frames, treat state as unsealed until next seal.
             if records.contains(where: {
                 switch $0 {
                 case .upsert, .delete: return true
@@ -156,8 +185,8 @@ public actor Collection {
                 }
             }) {
                 hasUnsealedData = true
-                unsealedPointCount = live.count
-                unsealedByteCount = live.values.reduce(0) { $0 + $1.vector.count * 4 }
+                unsealedPointCount = mutable.count + epochTombstones.count
+                unsealedByteCount = mutable.values.reduce(0) { $0 + $1.vector.count * 4 }
             }
         }
     }
@@ -186,7 +215,6 @@ public actor Collection {
         try ensureAcceptingMutations()
         try throwIfStickyUnrecoverable()
 
-        // Validate and materialize stored vectors first so we never write partial junk.
         var prepared: [(id: PointID, vector: [Float], payload: [String: PayloadValue])] = []
         prepared.reserveCapacity(points.count)
         for point in points {
@@ -208,7 +236,9 @@ public actor Collection {
         }
 
         for item in prepared {
-            live[item.id] = Entry(vector: item.vector, payload: item.payload)
+            mutable[item.id] = Entry(vector: item.vector, payload: item.payload)
+            idIndex[item.id] = .mutable
+            epochTombstones.remove(item.id)
         }
         noteUnsealedMutation(pointCount: prepared.count, vectorBytes: prepared.reduce(0) {
             $0 + $1.vector.count * MemoryLayout<Float>.size
@@ -227,15 +257,18 @@ public actor Collection {
         try throwIfStickyUnrecoverable()
 
         if let wal {
-            // Still write a delete record even if some ids are unknown — replay
-            // is idempotent and matches "caller asked to delete these ids".
             try appendRecords([.delete(ids: ids)], using: wal)
         }
 
         for id in ids {
-            if live.removeValue(forKey: id) != nil {
-                tombstoneCount += 1
-            }
+            Self.applyDelete(
+                id,
+                sealed: sealed,
+                mutable: &mutable,
+                idIndex: &idIndex,
+                epochTombstones: &epochTombstones,
+                tombstoneCount: &tombstoneCount
+            )
         }
         noteUnsealedMutation(pointCount: ids.count, vectorBytes: 0)
         try sealIfThresholdMet()
@@ -249,8 +282,9 @@ public actor Collection {
     public func get(ids: [PointID], withVector: Bool = false) -> [Point] {
         var result: [Point] = []
         result.reserveCapacity(ids.count)
+        let dim = collectionConfig.dimension
         for id in ids {
-            guard let entry = live[id] else { continue }
+            guard let entry = lookupLive(id, dim: dim) else { continue }
             result.append(
                 Point(
                     id: id,
@@ -281,7 +315,7 @@ public actor Collection {
             throw VectorSwiftError.invalidArgument("k must be >= 1, got \(request.k)")
         }
 
-        if live.isEmpty {
+        if idIndex.isEmpty {
             return []
         }
 
@@ -290,69 +324,69 @@ public actor Collection {
             query = try VectorValidation.normalized(query)
         }
 
-        let snapshot = liveSnapshot()
-        let count = snapshot.ids.count
         let dim = collectionConfig.dimension
+        var parts: [[ScoredPoint]] = []
+        parts.reserveCapacity(sealed.count + 1)
 
-        // Pack into one contiguous row-major matrix for FlatIndex / VectorCompute.
-        var matrix = [Float]()
-        matrix.reserveCapacity(count * dim)
-        for vector in snapshot.vectors {
-            matrix.append(contentsOf: vector)
-        }
-
-        let hits = try matrix.withUnsafeBufferPointer { buffer in
-            try FlatIndex.search(
+        for segment in sealed {
+            let hits = try searchSealed(
+                segment,
                 query: query,
-                database: buffer,
-                count: count,
-                dim: dim,
                 k: request.k,
-                metric: collectionConfig.metric,
-                compute: compute
+                dim: dim,
+                withPayload: request.withPayload,
+                withVector: request.withVector
             )
+            if !hits.isEmpty {
+                parts.append(hits)
+            }
         }
 
-        return hits.map { hit in
-            let i = Int(hit.row)
-            return ScoredPoint(
-                id: snapshot.ids[i],
-                distance: hit.distance,
-                payload: request.withPayload ? snapshot.payloads[i] : nil,
-                vector: request.withVector ? snapshot.vectors[i] : nil
+        if !mutable.isEmpty {
+            let hits = try searchMutable(
+                query: query,
+                k: request.k,
+                dim: dim,
+                withPayload: request.withPayload,
+                withVector: request.withVector
             )
+            if !hits.isEmpty {
+                parts.append(hits)
+            }
         }
+
+        return MultiSegmentMerge.topK(parts, k: request.k)
     }
 
     /// Number of live points, or live + tombstone count when requested.
     /// Reads ignore sticky fsync errors.
     public func count(includeTombstones: Bool = false) -> Int {
         if includeTombstones {
-            return live.count + tombstoneCount
+            return idIndex.count + tombstoneCount
         }
-        return live.count
+        return idIndex.count
     }
 
     /// Flushes durable state when a WAL is present.
     ///
     /// When there is unsealed data and a path-backed layout, materializes a sealed
-    /// segment (VECTORS/IDS/PAYLOAD + SEGMENT_META), appends a seal WAL record,
-    /// publishes MANIFEST, and reclaims the WAL. Otherwise appends a
-    /// `checkpointMark` and **fsyncs** (S14 durability barrier for every level).
+    /// segment (VECTORS/IDS/PAYLOAD/TOMBSTONES + SEGMENT_META), appends a seal WAL
+    /// record, publishes MANIFEST (append segment id), and reclaims the WAL.
+    /// Otherwise appends a `checkpointMark` and **fsyncs** (S14 durability barrier
+    /// for every level).
     public func checkpoint() throws {
         try ensureAcceptingMutations()
         guard wal != nil else { return }
-        if hasUnsealedData, layout != nil, !live.isEmpty {
+        if hasUnsealedData, layout != nil, hasSealableWork {
             try sealMutable()
             return
         }
-        // Retry path: does not short-circuit on sticky; attempts barrier fsync.
         try appendSyncedOrThrow(.checkpointMark)
     }
 
-    /// Forces a seal of the current live set when path-backed (test / advanced use).
+    /// Forces a seal of the current mutable overlay when path-backed.
     ///
-    /// No-op when there is no layout/WAL, no live points, or nothing unsealed.
+    /// No-op when there is no layout/WAL or nothing unsealed to materialize.
     public func seal() throws {
         try ensureAcceptingMutations()
         try sealMutable()
@@ -499,6 +533,10 @@ public actor Collection {
 
     // MARK: - Seal (mutable → sealed segment)
 
+    private var hasSealableWork: Bool {
+        !mutable.isEmpty || !epochTombstones.isEmpty
+    }
+
     private func noteUnsealedMutation(pointCount: Int, vectorBytes: Int) {
         hasUnsealedData = true
         unsealedPointCount += pointCount
@@ -514,26 +552,28 @@ public actor Collection {
         }
     }
 
-    /// Full-snapshot seal: write all live points to one segment, replace MANIFEST,
-    /// append seal_segment_v2, reclaim WAL, drop prior segment dirs.
+    /// Incremental seal: write mutable rows + epoch tombstones, append MANIFEST.
     private func sealMutable() throws {
         guard let layout, let wal else { return }
-        guard hasUnsealedData, !live.isEmpty else { return }
+        guard hasUnsealedData, hasSealableWork else { return }
 
         let segmentId = nextSegmentId
-        let rows: [SealedSegmentIO.Row] = live.map { id, entry in
+        let rows: [SealedSegmentIO.Row] = mutable.map { id, entry in
             SealedSegmentIO.Row(id: id, vector: entry.vector, payload: entry.payload)
         }
+        let tombstones = epochTombstones.sorted()
 
         let written = try SealedSegmentIO.writeSegment(
             segmentId: segmentId,
             dimension: collectionConfig.dimension,
             index: collectionConfig.index,
             rows: rows,
+            tombstones: tombstones,
             segmentDirectory: layout.segmentDirectory(collection: name, segmentId: segmentId),
             vectorsURL: layout.vectorsBin(collection: name, segmentId: segmentId),
             idsURL: layout.idsBin(collection: name, segmentId: segmentId),
             payloadURL: layout.payloadBin(collection: name, segmentId: segmentId),
+            tombstonesURL: layout.tombstonesBin(collection: name, segmentId: segmentId),
             metaURL: layout.segmentMeta(collection: name, segmentId: segmentId)
         )
 
@@ -553,26 +593,48 @@ public actor Collection {
                 from: layout.manifest(collection: name)
             )
         }
-        let previousIds = manifest.segmentIds
         manifest.generation += 1
-        manifest.segmentIds = [segmentId]
+        if !manifest.segmentIds.contains(segmentId) {
+            manifest.segmentIds.append(segmentId)
+        }
         manifest.walEpoch += 1
         try JSONFileStore.writeAtomic(manifest, to: layout.manifest(collection: name))
         try Self.fsyncFile(at: layout.manifest(collection: name))
 
-        // Reclaim pre-seal frames; live remains the source of truth in memory.
         try wal.resetEmpty()
         markDurableSuccess()
 
         nextSegmentId = segmentId + 1
         try persistCollectionMeta(layout: layout)
 
-        // Best-effort remove superseded segment directories.
-        for oldId in previousIds where oldId != segmentId {
-            let dir = layout.segmentDirectory(collection: name, segmentId: oldId)
-            try? FileManager.default.removeItem(at: dir)
+        var vectors: [Float] = []
+        var ids: [PointID] = []
+        var payloads: [[String: PayloadValue]] = []
+        vectors.reserveCapacity(rows.count * collectionConfig.dimension)
+        ids.reserveCapacity(rows.count)
+        payloads.reserveCapacity(rows.count)
+        for row in rows {
+            ids.append(row.id)
+            vectors.append(contentsOf: row.vector)
+            payloads.append(row.payload)
+        }
+        let newSegment = SealedSegment(
+            id: segmentId,
+            ids: ids,
+            vectors: vectors,
+            payloads: payloads,
+            tombstones: tombstones
+        )
+        sealed.append(newSegment)
+        for (row, id) in ids.enumerated() {
+            idIndex[id] = .sealed(segmentId: segmentId, row: UInt32(row))
+        }
+        for id in tombstones {
+            idIndex.removeValue(forKey: id)
         }
 
+        mutable.removeAll()
+        epochTombstones.removeAll()
         hasUnsealedData = false
         unsealedPointCount = 0
         unsealedByteCount = 0
@@ -599,11 +661,12 @@ public actor Collection {
         }
     }
 
-    private static func loadSealedIntoLive(
+    private static func loadSealed(
         layout: DatabaseLayout,
         collectionName: String,
         dimension: Int,
-        live: inout [PointID: Entry]
+        sealed: inout [SealedSegment],
+        idIndex: inout [PointID: Location]
     ) throws {
         let manifestURL = layout.manifest(collection: collectionName)
         guard JSONFileStore.exists(manifestURL) else { return }
@@ -617,26 +680,163 @@ public actor Collection {
         }
 
         for segmentId in manifest.segmentIds {
-            let rows = try SealedSegmentIO.loadSegment(
+            let loaded = try SealedSegmentIO.loadSegment(
                 segmentId: segmentId,
                 expectedDimension: dimension,
                 vectorsURL: layout.vectorsBin(collection: collectionName, segmentId: segmentId),
                 idsURL: layout.idsBin(collection: collectionName, segmentId: segmentId),
                 payloadURL: layout.payloadBin(collection: collectionName, segmentId: segmentId),
+                tombstonesURL: layout.tombstonesBin(collection: collectionName, segmentId: segmentId),
                 metaURL: layout.segmentMeta(collection: collectionName, segmentId: segmentId)
             )
-            for row in rows {
-                live[row.id] = Entry(vector: row.vector, payload: row.payload)
+
+            var vectors: [Float] = []
+            var ids: [PointID] = []
+            var payloads: [[String: PayloadValue]] = []
+            vectors.reserveCapacity(loaded.rows.count * dimension)
+            ids.reserveCapacity(loaded.rows.count)
+            payloads.reserveCapacity(loaded.rows.count)
+            for row in loaded.rows {
+                ids.append(row.id)
+                vectors.append(contentsOf: row.vector)
+                payloads.append(row.payload)
+            }
+
+            sealed.append(
+                SealedSegment(
+                    id: segmentId,
+                    ids: ids,
+                    vectors: vectors,
+                    payloads: payloads,
+                    tombstones: loaded.tombstones
+                )
+            )
+
+            for (row, id) in ids.enumerated() {
+                idIndex[id] = .sealed(segmentId: segmentId, row: UInt32(row))
+            }
+            for id in loaded.tombstones {
+                idIndex.removeValue(forKey: id)
             }
         }
     }
 
     // MARK: - Internals
 
-    /// Applies a single WAL record to in-memory state (no further WAL writes).
+    private func lookupLive(_ id: PointID, dim: Int) -> Entry? {
+        guard let loc = idIndex[id] else { return nil }
+        switch loc {
+        case .mutable:
+            return mutable[id]
+        case .sealed(let segmentId, let row):
+            guard let segment = sealed.first(where: { $0.id == segmentId }) else {
+                return nil
+            }
+            let r = Int(row)
+            guard r < segment.rowCount else { return nil }
+            return Entry(vector: segment.vector(at: r, dim: dim), payload: segment.payloads[r])
+        }
+    }
+
+    private func searchSealed(
+        _ segment: SealedSegment,
+        query: [Float],
+        k: Int,
+        dim: Int,
+        withPayload: Bool,
+        withVector: Bool
+    ) throws -> [ScoredPoint] {
+        if segment.rowCount == 0 {
+            return []
+        }
+        let liveIndex = idIndex
+        let segmentId = segment.id
+        let segmentIds = segment.ids
+        let hits = try segment.vectors.withUnsafeBufferPointer { buffer in
+            try FlatIndex.search(
+                query: query,
+                database: buffer,
+                count: segment.rowCount,
+                dim: dim,
+                k: k,
+                metric: collectionConfig.metric,
+                compute: compute,
+                isLive: { row in
+                    let id = segmentIds[Int(row)]
+                    if case .sealed(let sid, let r) = liveIndex[id], sid == segmentId, r == row {
+                        return true
+                    }
+                    return false
+                }
+            )
+        }
+        return hits.map { hit in
+            let i = Int(hit.row)
+            return ScoredPoint(
+                id: segment.ids[i],
+                distance: hit.distance,
+                payload: withPayload ? segment.payloads[i] : nil,
+                vector: withVector ? segment.vector(at: i, dim: dim) : nil
+            )
+        }
+    }
+
+    private func searchMutable(
+        query: [Float],
+        k: Int,
+        dim: Int,
+        withPayload: Bool,
+        withVector: Bool
+    ) throws -> [ScoredPoint] {
+        var ids: [PointID] = []
+        var vectors: [[Float]] = []
+        var payloads: [[String: PayloadValue]] = []
+        ids.reserveCapacity(mutable.count)
+        vectors.reserveCapacity(mutable.count)
+        payloads.reserveCapacity(mutable.count)
+        for (id, entry) in mutable {
+            // Skip stale mutable entries that are not the live location.
+            guard idIndex[id] == .mutable else { continue }
+            ids.append(id)
+            vectors.append(entry.vector)
+            payloads.append(entry.payload)
+        }
+        guard !ids.isEmpty else { return [] }
+
+        var matrix = [Float]()
+        matrix.reserveCapacity(ids.count * dim)
+        for vector in vectors {
+            matrix.append(contentsOf: vector)
+        }
+
+        let hits = try matrix.withUnsafeBufferPointer { buffer in
+            try FlatIndex.search(
+                query: query,
+                database: buffer,
+                count: ids.count,
+                dim: dim,
+                k: k,
+                metric: collectionConfig.metric,
+                compute: compute
+            )
+        }
+        return hits.map { hit in
+            let i = Int(hit.row)
+            return ScoredPoint(
+                id: ids[i],
+                distance: hit.distance,
+                payload: withPayload ? payloads[i] : nil,
+                vector: withVector ? vectors[i] : nil
+            )
+        }
+    }
+
     private static func applyRecord(
         _ record: WALRecord,
-        into live: inout [PointID: Entry],
+        sealed: [SealedSegment],
+        mutable: inout [PointID: Entry],
+        idIndex: inout [PointID: Location],
+        epochTombstones: inout Set<PointID>,
         tombstoneCount: inout Int,
         expectedDimension: Int,
         validateDimension: Bool
@@ -646,43 +846,45 @@ public actor Collection {
             if validateDimension {
                 try VectorValidation.requireDimension(vector, expected: expectedDimension)
             }
-            live[id] = Entry(vector: vector, payload: payload)
+            mutable[id] = Entry(vector: vector, payload: payload)
+            idIndex[id] = .mutable
+            epochTombstones.remove(id)
         case .delete(let ids):
             for id in ids {
-                if live.removeValue(forKey: id) != nil {
-                    tombstoneCount += 1
-                }
+                applyDelete(
+                    id,
+                    sealed: sealed,
+                    mutable: &mutable,
+                    idIndex: &idIndex,
+                    epochTombstones: &epochTombstones,
+                    tombstoneCount: &tombstoneCount
+                )
             }
         case .checkpointMark:
             break
         case .sealSegment, .sealSegmentV2:
-            // Segment rows are loaded from MANIFEST files before WAL replay.
-            // Seal records are accepted so logs remain readable.
             break
         }
     }
 
-    /// Copies live dictionary entries into parallel arrays for indexing.
-    ///
-    /// Row `i` in the packed matrix corresponds to `ids[i]`, `vectors[i]`, and
-    /// `payloads[i]`. Iteration order is the dictionary's current order; it is
-    /// stable for a single snapshot but not a public ordering guarantee.
-    private func liveSnapshot() -> (
-        ids: [PointID],
-        vectors: [[Float]],
-        payloads: [[String: PayloadValue]]
+    private static func applyDelete(
+        _ id: PointID,
+        sealed: [SealedSegment],
+        mutable: inout [PointID: Entry],
+        idIndex: inout [PointID: Location],
+        epochTombstones: inout Set<PointID>,
+        tombstoneCount: inout Int
     ) {
-        var ids: [PointID] = []
-        var vectors: [[Float]] = []
-        var payloads: [[String: PayloadValue]] = []
-        ids.reserveCapacity(live.count)
-        vectors.reserveCapacity(live.count)
-        payloads.reserveCapacity(live.count)
-        for (id, entry) in live {
-            ids.append(id)
-            vectors.append(entry.vector)
-            payloads.append(entry.payload)
+        if let loc = idIndex.removeValue(forKey: id) {
+            tombstoneCount += 1
+            if case .mutable = loc {
+                mutable.removeValue(forKey: id)
+            }
+        } else {
+            mutable.removeValue(forKey: id)
         }
-        return (ids, vectors, payloads)
+        if sealed.contains(where: { $0.ids.contains(id) }) {
+            epochTombstones.insert(id)
+        }
     }
 }

@@ -116,4 +116,37 @@ final class StorageMetaTests: XCTestCase {
         let loaded = try JSONFileStore.read(CatalogDocument.self, from: url)
         XCTAssertEqual(loaded, doc)
     }
+
+    func testAtomicMetaOverwriteKeepsCanonicalPath() throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("MANIFEST.json")
+        try JSONFileStore.writeAtomic(
+            ManifestDocument(generation: 1, segmentIds: [1], walEpoch: 1),
+            to: url
+        )
+        try JSONFileStore.writeAtomic(
+            ManifestDocument(generation: 2, segmentIds: [1, 2], walEpoch: 2),
+            to: url
+        )
+        XCTAssertTrue(JSONFileStore.exists(url))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: url.appendingPathExtension("tmp").path)
+        )
+        let loaded = try JSONFileStore.read(ManifestDocument.self, from: url)
+        XCTAssertEqual(loaded.generation, 2)
+        XCTAssertEqual(loaded.segmentIds, [1, 2])
+    }
+
+    func testLeftoverTmpDoesNotAffectRead() throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("MANIFEST.json")
+        let good = ManifestDocument(generation: 3, segmentIds: [7], walEpoch: 1)
+        try JSONFileStore.writeAtomic(good, to: url)
+        let junk = url.appendingPathExtension("tmp")
+        try Data("{ not-the-manifest".utf8).write(to: junk)
+        let loaded = try JSONFileStore.read(ManifestDocument.self, from: url)
+        XCTAssertEqual(loaded, good)
+    }
 }
