@@ -19,6 +19,9 @@ in applications and Swift services.
   `SEGMENT_META.json`), atomically append it to `MANIFEST.json`, and reclaim the WAL
 - **Search** merges exact top-k across sealed segments + the mutable overlay
   (last write wins; tombstones hide deleted sealed ids). Compaction is not finished yet
+- **Recovery** on open: torn WAL tails are truncated; segment directories not listed
+  in `MANIFEST.json` are ignored and removed; leftover `*.tmp` publish files are
+  discarded; checksum failure on a listed segment file fails closed (`corrupted`)
 
 Approximate indexes, metadata filters, and GPU acceleration are not available yet.
 
