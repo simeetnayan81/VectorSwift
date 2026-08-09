@@ -14,6 +14,7 @@ import Foundation
 ///       VECTORS.bin
 ///       IDS.bin
 ///       PAYLOAD.bin
+///       TOMBSTONES.bin
 ///       SEGMENT_META.json
 /// ```
 public struct DatabaseLayout: Sendable {
@@ -87,5 +88,10 @@ public struct DatabaseLayout: Sendable {
     public func segmentMeta(collection: String, segmentId: UInt64) -> URL {
         segmentDirectory(collection: collection, segmentId: segmentId)
             .appendingPathComponent("SEGMENT_META.json", isDirectory: false)
+    }
+
+    public func tombstonesBin(collection: String, segmentId: UInt64) -> URL {
+        segmentDirectory(collection: collection, segmentId: segmentId)
+            .appendingPathComponent("TOMBSTONES.bin", isDirectory: false)
     }
 }
