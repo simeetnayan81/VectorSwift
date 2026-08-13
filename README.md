@@ -12,7 +12,8 @@ in applications and Swift services.
 - Metrics: Euclidean (L2 / L2²), inner product, cosine
 - Optional on-disk root when you open with a directory path:
   catalog metadata (`DB_META.json`, `CATALOG.json`, `collections/<name>/COLL_META.json`)
-  plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes survive reopen
+  plus per-collection **WAL** (`wal/wal.log`) so upserts/deletes (vectors **and** payloads)
+  survive reopen via `get` / `search`
 - **Durability levels** (`relaxed` / `balanced` default / `strict`): control when the WAL is fsynced; `checkpoint()` and clean `close()` fsync for all levels
 - **Seal**: `checkpoint()` / size thresholds flush the mutable overlay to a new
   sealed segment (`VECTORS.bin` / `IDS.bin` / `PAYLOAD.bin` / `TOMBSTONES.bin` +
@@ -132,11 +133,13 @@ for hit in results {
 
 try await db.close()
 
-// Reopen the same root: collection list/config and points reload from disk (WAL).
+// Reopen the same root: collection list/config, vectors, and payloads reload from disk (WAL).
 let again = try await Database.open(path: root)
 print(try await again.listCollections())
 let reopened = try await again.collection(name: "documents")
 print(await reopened.count()) // 3
+let intro = await reopened.get(ids: ["intro"], withVector: false)
+print(intro.first?.payload["title"] as Any) // .string("Introduction")
 try await again.close()
 ```
 

@@ -81,7 +81,7 @@ struct QuickStart {
 
         try await db.close()
 
-        // Reopen the same root: catalog meta + WAL replay restore points.
+        // Reopen the same root: catalog meta + WAL replay restore points and payloads.
         db = try await Database.open(path: root)
         let names = try await db.listCollections()
         print("")
@@ -89,11 +89,21 @@ struct QuickStart {
         let reopened = try await db.collection(name: collectionName)
         let liveCount = await reopened.count()
         print("Live points after reopen (via WAL): \(liveCount)")
+        let restored = await reopened.get(ids: ["intro"], withVector: false)
+        if let point = restored.first, case .string(let title)? = point.payload["title"] {
+            print("get(\"intro\") after reopen: title=\(title)")
+        }
         let again = try await reopened.search(
             SearchRequest(vector: [1, 0.05, 0], k: 1, withPayload: true)
         )
         if let top = again.first {
-            print("Top hit after reopen: \(top.id) distance=\(top.distance)")
+            let title: String
+            if case .string(let value)? = top.payload?["title"] {
+                title = value
+            } else {
+                title = "(untitled)"
+            }
+            print("Top hit after reopen: \(top.id) distance=\(top.distance) title=\(title)")
         }
         try await db.close()
 
